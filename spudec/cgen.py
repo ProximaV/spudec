@@ -66,6 +66,21 @@ _BITWISE = {
 
 
 # ---------------------------------------------------------------------------
+# CodeLines container
+# ---------------------------------------------------------------------------
+
+
+class CodeLines(list):
+    """List of generated C lines carrying parallel line_eas, line_to_eas, ea_to_line, header_count."""
+    def __init__(self, iterable=None):
+        super(CodeLines, self).__init__(iterable or [])
+        self.line_eas = []
+        self.line_to_eas = {}
+        self.ea_to_line = {}
+        self.header_count = 0
+
+
+# ---------------------------------------------------------------------------
 # naming (phi-web coalescing)
 # ---------------------------------------------------------------------------
 
@@ -304,35 +319,45 @@ def _chain_positions(ok, defs, use_site):
 class CGen(object):
 
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
-                 stk_of=None, this_of=None, sym_of=None):
+                 stk_of=None, this_of=None, sym_of=None,
+                 user_renames=None, user_types=None, user_proto=None):
         self.func = func
         self.arity_of = arity_of
-        # Resolves a constant address to a string literal; see data.py.  None
-        # disables it, which is what a database-free caller wants.
         self.str_of = str_of or (lambda ea: None)
-        # Resolves a constant address to a named data symbol (a vtable, a key
-        # table, a global), so it prints as `&name` instead of a bare literal.
-        # Off by default, like `str_of`, so cgen runs without a database.
         self.sym_of = sym_of or (lambda ea: None)
-        # Which operands of each call are really its arguments.  Needs the
-        # callee's arity: the operand list names every argument register
-        # because a callee *might* read them, so without knowing how many it
-        # actually takes there is no way to tell arguments from noise.
-        self.call_args = {}
-        if arity_of is not None:
-            for insn in func.insns():
-                if insn.op != Op.CALL or insn.aux is None:
-                    continue
-                n = arity_of(insn.aux)
-                if n:
-                    args = call_arguments(insn, n)
-                    if args:
-                        self.call_args[id(insn)] = args
+        self.user_renames = dict(user_renames or {})
+        self.user_types = dict(user_types or {})
+        self.user_proto = user_proto
+
+        self.body_eas = []
+        self.body_line_to_eas = {}
+        self._current_inlined_eas = []
 
         # Parameters get positional names (a1, a2, ...) the way a real
         # decompiler shows them; the register each one came from goes in the
         # header comment so the mapping back to the disassembly is not lost.
         self.params = _params(func, arity_of)
+
+        # Which operands of each call are really its arguments.
+        self.call_args = {}
+        for insn in func.insns():
+            if insn.op in (Op.CALL, Op.ICALL):
+                args = self._compute_call_args(insn, arity_of)
+                if args:
+                    self.call_args[id(insn)] = args
+
+        self.call_return = {}
+        self._suppressed_call_undefs = set()
+        for b in func.blocks:
+            for idx, insn in enumerate(b.insns):
+                if insn.op in (Op.CALL, Op.ICALL):
+                    for other in b.insns[idx + 1:]:
+                        if other.ea != insn.ea:
+                            break
+                        if other.op == Op.UNDEF and other.dst is not None and other.dst.reg == regs.ARG_FIRST:
+                            self.call_return[id(insn)] = other.dst
+                            self._suppressed_call_undefs.add(id(other))
+                            break
         # A non-static member function's r3 is the hidden `this`, named from
         # the class the function belongs to (see data.Members and `_this_reg`).
         self.member_class = this_of(func.start_ea) if this_of is not None \
@@ -346,14 +371,28 @@ class CGen(object):
         self.param_name = {}
         pnames = {}
         ai = 0
+        if self.user_proto:
+            from . import abi
+            parsed = abi._parse_proto(self.user_proto, func.name or ("sub_%X" % func.start_ea))
+            if parsed and parsed.params:
+                for idx, p in enumerate(parsed.params):
+                    reg_num = regs.ARG_FIRST + idx
+                    if reg_num not in self.params:
+                        self.params.append(reg_num)
+                    p_eff_name = self.user_renames.get(p.name, p.name)
+                    self.param_name[reg_num] = p_eff_name
+                    pnames[(reg_num, 0)] = p_eff_name
         for r in self.params:
+            if r in self.param_name:
+                continue
             if r == self.this_reg:
                 nm = "this"
             else:
                 ai += 1
                 nm = "a%d" % ai
-            self.param_name[r] = nm
-            pnames[(r, 0)] = nm
+            eff_nm = self.user_renames.get(nm, nm)
+            self.param_name[r] = eff_nm
+            pnames[(r, 0)] = eff_nm
         self.namer = Namer(func, pnames, self.call_args)
         # Argument setup may fold into the call now that the call shows its
         # arguments -- but only for operands that are actually rendered.  A
@@ -422,6 +461,51 @@ class CGen(object):
             func.types = self.types
             func.type_stats = stats
 
+    def _compute_call_args(self, insn, arity_of):
+        by_reg = {}
+        for s in insn.srcs:
+            if s.is_var and regs.ARG_FIRST <= s.reg <= regs.ARG_LAST:
+                by_reg[s.reg] = s
+        if not by_reg:
+            return []
+
+        callee_var = False
+        if insn.op == Op.CALL and insn.aux is not None:
+            try:
+                from . import is_variadic
+                callee_var = is_variadic(insn.aux)
+            except Exception:
+                pass
+
+        n = None
+        if insn.op == Op.CALL and insn.aux is not None and arity_of is not None:
+            n = arity_of(insn.aux)
+
+        if not callee_var and n is not None and 0 < n <= len(by_reg):
+            out = []
+            for i in range(n):
+                r = regs.ARG_FIRST + i
+                if r in by_reg:
+                    out.append(by_reg[r])
+                else:
+                    break
+            return out
+        if n == 0:
+            return []
+
+        # Variadic, unknown arity, or ICALL: determine from active setup (ver > 0)
+        out = []
+        for i in range(len(by_reg)):
+            r = regs.ARG_FIRST + i
+            v = by_reg.get(r)
+            if v is None:
+                break
+            if v.ver > 0:
+                out.append(v)
+            else:
+                break
+        return out
+
     # -- operands ----------------------------------------------------------
 
     def _rendered_keys(self):
@@ -442,7 +526,7 @@ class CGen(object):
         """The printed name of a value, recording that it was printed."""
         name = self.namer.name(v)
         self.printed.add(name)
-        return name
+        return self.user_renames.get(name, name)
 
     def nma(self, v):
         """
@@ -454,9 +538,10 @@ class CGen(object):
         that would assign it -- the epilogue restore -- prints nothing.  Only
         a name that really gets assigned somewhere is a local.
         """
-        name = self.nm(v)
+        name = self.namer.name(v)
+        self.printed.add(name)
         self.assigned.add(name)
-        return name
+        return self.user_renames.get(name, name)
 
 
     def const(self, c, scalar, strings=True):
@@ -474,7 +559,12 @@ class CGen(object):
                 return lit
         sym = self.sym_of(c.val >> 96)
         if sym is not None:
-            return "&" + sym
+            if " + " in sym:
+                base, off = sym.split(" + ", 1)
+                eff_base = self.user_renames.get(base, base)
+                return "&" + eff_base + " + " + off
+            eff_sym = self.user_renames.get(sym, sym)
+            return "&" + eff_sym
         return c.scalar_str() if scalar else str(c)
 
     def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
@@ -492,7 +582,10 @@ class CGen(object):
         if v.is_const:
             return self.const(v, scalar, strings)
         if depth < MAX_INLINE_DEPTH and v.key() in self.inlinable:
-            return self.rhs(self.defs[v.key()], depth + 1, top=top,
+            def_insn = self.defs[v.key()]
+            if getattr(def_insn, "ea", None) is not None:
+                self._current_inlined_eas.append(def_insn.ea)
+            return self.rhs(def_insn, depth + 1, top=top,
                             want_scalar=want_scalar, strings=strings)
         return self.nm(v)
 
@@ -504,7 +597,12 @@ class CGen(object):
                     return lit
             sym = self.sym_of(v.val >> 96)
             if sym is not None:
-                return "&" + sym
+                if " + " in sym:
+                    base, off = sym.split(" + ", 1)
+                    eff_base = self.user_renames.get(base, base)
+                    return "&" + eff_base + " + " + off
+                eff_sym = self.user_renames.get(sym, sym)
+                return "&" + eff_sym
             return "0x%X" % (v.val >> 96)
         return self.operand(v, depth, top=True, want_scalar=True,
                             strings=strings)
@@ -530,6 +628,8 @@ class CGen(object):
             # A constant assigned to something the types say is a scalar
             # prints as a scalar, even when the lifter could not prove it was
             # one: `0x3e000` rather than `#0x3e000:w4`.
+            if insn.dst is not None and insn.dst.reg == regs.ARG_FIRST:
+                sc = True
             t = self.type_of(insn.dst) if insn.dst is not None else None
             if not sc and t is not None and t.kind in (types.INT, types.PTR,
                                                        types.UNK) \
@@ -551,8 +651,11 @@ class CGen(object):
         if op in (Op.LOAD, Op.LOADQ, Op.LOADU):
             return self._deref(insn, depth)
         if op in (Op.CALL, Op.ICALL):
-            tgt = (self.name_of(insn.aux) if op == Op.CALL
-                   else "(*%s)" % self.operand(insn.srcs[0], depth))
+            if op == Op.CALL:
+                raw_tgt = self.name_of(insn.aux)
+                tgt = self.user_renames.get(raw_tgt, raw_tgt)
+            else:
+                tgt = "(*%s)" % self.operand(insn.srcs[0], depth)
             args = self.call_args.get(id(insn))
             if not args:
                 return "%s()" % tgt
@@ -792,25 +895,44 @@ class CGen(object):
 
         groups = {}
         for insn in self.func.insns():
-            if insn.op not in MEM_READS and insn.op not in MEM_WRITES:
-                continue
-            if len(insn.srcs) < 2:
-                continue
-            base, off, _ = addr_expr(insn.srcs[1], self.defs)
-            if base != sp_in:
-                if base in tainted:
-                    self.stack_unresolved += 1
-                continue
-            g = groups.setdefault((base, off),
-                                  {"ew": None, "types": {}, "name": None})
-            ew = insn.ew
-            if g["ew"] is None or int(ew) > int(g["ew"]):
-                g["ew"] = ew
-            g["types"].setdefault(ew, set()).add(self._access_type(insn))
-            if g["name"] is None:
-                hit = self.stk_of(insn.ea)
-                if hit is not None and hit[0]:
-                    g["name"] = hit[0]
+            if insn.op in MEM_READS or insn.op in MEM_WRITES:
+                if len(insn.srcs) < 2:
+                    continue
+                base, off, _ = addr_expr(insn.srcs[1], self.defs)
+                if base != sp_in:
+                    if base in tainted:
+                        self.stack_unresolved += 1
+                    continue
+                g = groups.setdefault((base, off),
+                                      {"ew": None, "types": {}, "name": None})
+                ew = insn.ew
+                if g["ew"] is None or int(ew) > int(g["ew"]):
+                    g["ew"] = ew
+                g["types"].setdefault(ew, set()).add(self._access_type(insn))
+                if g["name"] is None and insn.ea:
+                    hit = self.stk_of(insn.ea)
+                    if hit is not None and hit[0]:
+                        g["name"] = hit[0]
+            elif insn.op == Op.ADD:
+                d = insn.defines()
+                if d is not None:
+                    base, off, _ = addr_expr(d, self.defs)
+                    if base == sp_in:
+                        signed_off = frame.signed_offset(off)
+                        if signed_off != 0 and (self.frame.size is None or -self.frame.size <= signed_off <= 0x40):
+                            g = groups.setdefault((base, off), {"ew": EW.Q, "types": {}, "name": None})
+                            if g["ew"] is None:
+                                g["ew"] = EW.Q
+                            g["types"].setdefault(EW.Q, set()).add("qword")
+                            if g["name"] is None and insn.ea:
+                                hit = self.stk_of(insn.ea)
+                                if hit is not None and hit[0]:
+                                    g["name"] = hit[0]
+                            if g["name"] is None:
+                                if signed_off < 0:
+                                    g["name"] = "var_%X" % abs(signed_off)
+                                else:
+                                    g["name"] = "arg_%X" % signed_off
 
         # The frame's own slots are not locals.  Naming them turned the frame
         # adjust into `sp_2 = &var_150;` -- true, since the new stack pointer
@@ -852,7 +974,8 @@ class CGen(object):
         if hit is None:
             return None
         self.stack_decls[hit[0]] = hit[1]
-        return "&" + hit[0]
+        eff_hit = self.user_renames.get(hit[0], hit[0])
+        return "&" + eff_hit
 
     def _stack_name(self, insn):
         """
@@ -871,9 +994,10 @@ class CGen(object):
             return None
         name, ct, ew = hit
         self.stack_decls[name] = ct
+        eff_name = self.user_renames.get(name, name)
         if insn.ew == ew:
-            return name
-        return "*(%s *)&%s" % (self._access_type(insn), name)
+            return eff_name
+        return "*(%s *)&%s" % (self._access_type(insn), eff_name)
 
     def _deref(self, insn, depth=0):
         """
@@ -898,7 +1022,12 @@ class CGen(object):
         # there may well be text today, but `*(char *)"..." = x` reads as an
         # assignment to a constant rather than as a write into a buffer.
         strings = insn.op not in (Op.STORE, Op.STOREQ)
-        return "*(%s *)(%s)" % (t, self.addr(addr, depth, strings=strings))
+        addr_text = self.addr(addr, depth, strings=strings)
+        if addr_text.startswith("&"):
+            if " " not in addr_text:
+                return "*(%s *)%s" % (t, addr_text)
+            return "*(%s *)(%s)" % (t, addr_text)
+        return "*(%s *)(%s)" % (t, addr_text)
 
     @staticmethod
     def _pointee_matches(pointee, insn):
@@ -923,7 +1052,7 @@ class CGen(object):
         # argument and a local, because the incoming value is one web and
         # anything the function writes to that register later is another.
         # Only the incoming web is the parameter.
-        pnames = set(self.param_name.values())
+        pnames = set(self.param_name.values()) | {self.user_renames.get(n, n) for n in self.param_name.values()}
         by_name = {}
         for insn in self.func.insns():
             d = insn.defines()
@@ -944,9 +1073,19 @@ class CGen(object):
                 # that guarantees an inlined definition never falls back to
                 # printing its name.
                 continue
-            if nm in by_name or nm in pnames:
+            eff_nm = self.user_renames.get(nm, nm)
+            if eff_nm in by_name or eff_nm in pnames or nm in pnames:
                 continue
-            by_name[nm] = self.ctype(self.type_of(d))
+            ct = self.user_types.get(nm, self.user_types.get(eff_nm, self.ctype(self.type_of(d))))
+            by_name[eff_nm] = ct
+
+        for ret_var in getattr(self, "call_return", {}).values():
+            nm = self.namer.name(ret_var)
+            if nm in self.assigned:
+                eff_nm = self.user_renames.get(nm, nm)
+                if eff_nm not in by_name and eff_nm not in pnames and nm not in pnames:
+                    ct = self.user_types.get(nm, self.user_types.get(eff_nm, self.ctype(self.type_of(ret_var))))
+                    by_name[eff_nm] = ct
 
         # Registers the function reads but never writes, outside the range the
         # ABI calls arguments.  They are genuine inputs -- callee-saved
@@ -966,16 +1105,22 @@ class CGen(object):
                 nm = self.namer.name(u)
                 if nm not in self.printed:
                     continue      # the body never mentions it
-                if nm in pnames or nm in by_name or nm in live_in:
+                eff_nm = self.user_renames.get(nm, nm)
+                if eff_nm in pnames or eff_nm in by_name or eff_nm in live_in or nm in pnames:
                     continue
-                live_in[nm] = self.ctype(self.type_of(u))
+                ct = self.user_types.get(nm, self.user_types.get(eff_nm, self.ctype(self.type_of(u))))
+                live_in[eff_nm] = ct
 
         # Stack slots are storage, not values: a slot this function only
         # reads was filled by something else (a callee handed a pointer to
         # it), so unlike a register name it is declared whether or not
         # anything here assigns it.  The annotation says which kind it is.
-        stack = {nm: ct for nm, ct in self.stack_decls.items()
-                 if nm not in pnames and nm not in by_name}
+        stack = {}
+        for nm, ct in self.stack_decls.items():
+            eff_nm = self.user_renames.get(nm, nm)
+            if eff_nm not in pnames and eff_nm not in by_name and eff_nm not in live_in and nm not in pnames:
+                eff_ct = self.user_types.get(nm, self.user_types.get(eff_nm, ct))
+                stack[eff_nm] = eff_ct
 
         if not by_name and not live_in and not stack:
             return []
@@ -1087,9 +1232,7 @@ class CGen(object):
         operands, so a value some indeterminate callee might take is never
         removed even if it did feed the idiom.
         """
-        roots = getattr(self.func, "store_idiom_roots", None)
-        if not roots:
-            return set()
+        roots = getattr(self.func, "store_idiom_roots", None) or set()
         defs = self.defs
 
         # 1. Arity-aware liveness: what a real reader (or a call that really
@@ -1149,12 +1292,14 @@ class CGen(object):
         # constant folds into the scalar store before this idiom is even
         # matched -- so the store spells it inline and the `ila` is left as a
         # dead `r5 = #0x2e698:w4` the call's operand list still pins.  A dead
-        # constant read by nothing real carries no information wherever it sits,
-        # so drop those too (only loads need the cone's provenance).
-        cone |= {k for k in dead if defs[k].op == Op.CONST}
+        # constant or unused stack address computation read by nothing real
+        # carries no information wherever it sits, so drop those too.
+        cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD)}
         return cone
 
     def _suppressed(self, insn, d):
+        if id(insn) in getattr(self, "_suppressed_call_undefs", ()):
+            return True
         """
         Whether this definition never reaches the output at all.
 
@@ -1166,6 +1311,8 @@ class CGen(object):
         """
         if insn.op == Op.PHI:
             return self._trivial_phi(insn)
+        if id(insn) in self.frame.hidden:
+            return True
         # Dead idiom debris a known-arity call's operand list pinned past DCE.
         if d is not None and d.key() in self.debris:
             return True
@@ -1185,6 +1332,8 @@ class CGen(object):
 
     def insn_stmt(self, insn):
         """One IR instruction as a statement, or None if it is absorbed."""
+        if id(insn) in self.frame.hidden:
+            return None
         op = insn.op
         if op == Op.PHI and self._trivial_phi(insn):
             return None                       # control flow expresses it now
@@ -1203,13 +1352,14 @@ class CGen(object):
         if d is not None and self._suppressed(insn, d):
             return None
         if op == Op.CIJMP:
-            kind = insn.aux or "z"
-            v = self.operand(insn.srcs[0], 0, True)
-            test = {"z": "%s == 0", "nz": "%s != 0",
-                    "hz": "(%s & 0xFFFF) == 0",
-                    "hnz": "(%s & 0xFFFF) != 0"}[kind] % v
-            return "if ( %s ) goto *%s;" % (
-                test, self.operand(insn.srcs[1], 0, True))
+            kind = insn.aux[1] if (isinstance(insn.aux, tuple) and len(insn.aux) > 1) else (insn.aux or "z")
+            from .structure import Cond
+            test = self._cond(Cond(insn.srcs[0], kind))
+            tgt = insn.aux[0] if (isinstance(insn.aux, tuple) and len(insn.aux) > 0) else None
+            if tgt is not None and tgt != 0:
+                return "if ( %s ) goto loc_%X;" % (test, tgt)
+            target_str = self.operand(insn.srcs[1], 0, True) if len(insn.srcs) > 1 else "?"
+            return "if ( %s ) goto *%s;" % (test, target_str)
 
         if op in (Op.STORE, Op.STOREQ):
             if id(insn) in self.frame.hidden:
@@ -1241,6 +1391,9 @@ class CGen(object):
                 self.operand(insn.srcs[1], 0, True))
         if op in (Op.CALL, Op.ICALL):
             text = self.rhs(insn)
+            ret_var = self.call_return.get(id(insn))
+            if ret_var is not None:
+                return "%s = %s;" % (self.nma(ret_var), text)
             if d is not None and d.reg not in regs.PSEUDO:
                 return "%s = %s;" % (self.nma(d), text)
             return text + ";"
@@ -1255,74 +1408,177 @@ class CGen(object):
 
     # -- the AST -----------------------------------------------------------
 
+    def _add_line(self, out, text, primary_ea=None, inlined_eas=None):
+        lineno = len(out)
+        out.append(text)
+        self.body_eas.append(primary_ea)
+        all_eas = ([primary_ea] if primary_ea is not None else []) + list(inlined_eas or [])
+        unique_eas = list(dict.fromkeys(e for e in all_eas if e is not None))
+        self.body_line_to_eas[lineno] = unique_eas
+
     def emit(self, stmts, out, indent, info):
         pad = "    " * indent
         for st in stmts:
             if isinstance(st, Basic):
                 for insn in st.insns:
+                    self._current_inlined_eas = []
                     text = self.insn_stmt(insn)
                     if text:
-                        out.append(pad + text)
+                        self._add_line(out, pad + text, primary_ea=insn.ea,
+                                       inlined_eas=self._current_inlined_eas)
             elif isinstance(st, If):
-                out.append("%sif ( %s )" % (pad, self._cond(st.cond)))
-                out.append(pad + "{")
+                self._current_inlined_eas = []
+                cond_str = self._cond(st.cond)
+                ea = getattr(st, "ea", None)
+                self._add_line(out, "%sif ( %s )" % (pad, cond_str),
+                               primary_ea=ea, inlined_eas=self._current_inlined_eas)
+                self._add_line(out, pad + "{", primary_ea=None)
                 self.emit(st.then, out, indent + 1, info)
-                out.append(pad + "}")
+                self._add_line(out, pad + "}", primary_ea=None)
                 if st.els:
-                    out.append(pad + "else")
-                    out.append(pad + "{")
+                    self._add_line(out, pad + "else", primary_ea=None)
+                    self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.els, out, indent + 1, info)
-                    out.append(pad + "}")
+                    self._add_line(out, pad + "}", primary_ea=None)
             elif isinstance(st, Loop):
+                hdr_ea = getattr(st.header, "start_ea", None) if getattr(st, "header", None) else None
                 if st.kind == "while":
-                    out.append("%swhile ( %s )" % (pad, self._cond(st.cond)))
-                    out.append(pad + "{")
+                    self._current_inlined_eas = []
+                    cond_str = self._cond(st.cond)
+                    self._add_line(out, "%swhile ( %s )" % (pad, cond_str),
+                                   primary_ea=hdr_ea, inlined_eas=self._current_inlined_eas)
+                    self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.body, out, indent + 1, info)
-                    out.append(pad + "}")
+                    self._add_line(out, pad + "}", primary_ea=None)
                 elif st.kind == "dowhile":
-                    out.append(pad + "do")
-                    out.append(pad + "{")
+                    self._add_line(out, pad + "do", primary_ea=hdr_ea)
+                    self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.body, out, indent + 1, info)
-                    out.append("%s} while ( %s );" % (pad,
-                                                      self._cond(st.cond)))
+                    self._current_inlined_eas = []
+                    cond_str = self._cond(st.cond)
+                    self._add_line(out, "%s} while ( %s );" % (pad, cond_str),
+                                   primary_ea=hdr_ea, inlined_eas=self._current_inlined_eas)
                 else:
-                    out.append("%sfor ( ;; )" % pad)
-                    out.append(pad + "{")
+                    self._add_line(out, "%sfor ( ;; )" % pad, primary_ea=hdr_ea)
+                    self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.body, out, indent + 1, info)
-                    out.append(pad + "}")
+                    self._add_line(out, pad + "}", primary_ea=None)
             elif isinstance(st, Break):
-                out.append(pad + "break;")
+                self._add_line(out, pad + "break;", primary_ea=None)
             elif isinstance(st, Continue):
-                out.append(pad + "continue;")
+                self._add_line(out, pad + "continue;", primary_ea=None)
             elif isinstance(st, Goto):
-                out.append("%sgoto %s;" % (pad, _lbl(st.target)))
+                tgt_ea = getattr(st.target, "start_ea", None)
+                self._add_line(out, "%sgoto %s;" % (pad, _lbl(st.target)), primary_ea=tgt_ea)
             elif isinstance(st, Label):
                 # Structuring marks every block; only the ones something
                 # actually jumps to become labels in the output.
                 if st.block.id in info["labels"]:
-                    out.append("%s%s:" % ("    " * max(indent - 1, 0),
-                                          _lbl(st.block)))
+                    self._add_line(out, "%s%s:" % ("    " * max(indent - 1, 0),
+                                                   _lbl(st.block)), primary_ea=st.block.start_ea)
             elif isinstance(st, Return):
-                out.append(pad + self._return(st.insn))
+                self._current_inlined_eas = []
+                ret_str = self._return(st.insn)
+                self._add_line(out, pad + ret_str, primary_ea=getattr(st.insn, "ea", None),
+                               inlined_eas=self._current_inlined_eas)
             elif isinstance(st, Tail):
+                self._current_inlined_eas = []
+                ea = getattr(st.insn, "ea", None)
                 if st.insn.op == Op.IJMP:
                     blk = st.insn.block
                     kind = ("jump table" if blk is not None
                             and len(blk.succs) > 1 else "indirect / tail call")
-                    out.append("%sgoto *%s;   // %s"
-                               % (pad, self.operand(st.insn.srcs[0], 0, True),
-                                  kind))
+                    txt = "%sgoto *%s;   // %s" % (pad, self.operand(st.insn.srcs[0], 0, True), kind)
+                    self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
                 elif st.insn.op == Op.JMP:
-                    out.append("%sgoto loc_%X;   // outside this function"
-                               % (pad, st.insn.aux))
+                    self._add_line(out, "%sgoto loc_%X;   // outside this function" % (pad, st.insn.aux), primary_ea=ea)
                 else:
-                    out.append(pad + self.rhs(st.insn) + ";")
+                    txt = pad + self.rhs(st.insn) + ";"
+                    self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
+
+    def _simplify_cond(self, val, k):
+        cur = val
+        chain_eas = []
+        seen = set()
+        while cur.is_var and cur.key() in self.defs and cur.key() not in seen:
+            seen.add(cur.key())
+            d = self.defs[cur.key()]
+            if d.op == Op.MOV and len(d.srcs) == 1:
+                if getattr(d, "ea", None) is not None:
+                    chain_eas.append(d.ea)
+                cur = d.srcs[0]
+                continue
+            if d.op == Op.EXTS and d.ew in (EW.H, EW.W) and len(d.srcs) == 1:
+                if getattr(d, "ea", None) is not None:
+                    chain_eas.append(d.ea)
+                cur = d.srcs[0]
+                continue
+            break
+
+        if cur.is_var and cur.key() in self.defs:
+            d = self.defs[cur.key()]
+            if d.op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.FCMPEQ, Op.FCMPGT) and len(d.srcs) == 2:
+                if getattr(d, "ea", None) is not None:
+                    chain_eas.append(d.ea)
+                self._current_inlined_eas.extend(chain_eas)
+                self._suppressed_call_undefs.add(id(d))
+                is_zero = (k in ("z", "hz"))
+                lhs = self.operand(d.srcs[0], 0, True, want_scalar=True)
+                rhs = self.operand(d.srcs[1], 0, True, want_scalar=True)
+
+                if d.srcs[1].is_const and (d.srcs[1].val >> 96) == 0:
+                    rhs = "0"
+                if d.srcs[0].is_const and (d.srcs[0].val >> 96) == 0:
+                    lhs = "0"
+
+                if d.op in (Op.CMPEQ, Op.FCMPEQ):
+                    op_sym = "!=" if is_zero else "=="
+                elif d.op in (Op.CMPGT, Op.FCMPGT):
+                    op_sym = "<=" if is_zero else ">"
+                    if op_sym == "<=" and rhs in ("-1", "-0x1", "-0x1:w4"):
+                        op_sym = "<"
+                        rhs = "0"
+                    elif op_sym == ">" and rhs in ("-1", "-0x1", "-0x1:w4"):
+                        op_sym = ">="
+                        rhs = "0"
+                elif d.op == Op.CMPGTU:
+                    op_sym = "<=" if is_zero else ">"
+
+                return "%s %s %s" % (lhs, op_sym, rhs)
+
+        return None
+
+    def _invert_or_simplify_relational(self, v, inverted):
+        s = v.strip()
+        if s.startswith("(") and s.endswith(")"):
+            s = s[1:-1].strip()
+
+        ops = [(" == ", "!="), (" != ", "=="), (" <= ", ">"), (" >= ", "<"),
+               (" >s ", "<=s"), (" <=s ", ">s"), (" >u ", "<=u"), (" <=u ", ">u"),
+               (" < ", ">="), (" > ", "<=")]
+        for sym, inv_sym in ops:
+            if sym in s:
+                lhs, rhs = s.split(sym, 1)
+                final_sym = inv_sym.strip() if inverted else sym.strip()
+                return "%s %s %s" % (lhs.strip(), final_sym, rhs.strip())
+        return None
 
     def _cond(self, cond):
         if cond is None:
             return "1"
-        v = self.operand(cond.value, 0, True)
         k = cond.effective
+        val = cond.value
+
+        simplified = self._simplify_cond(val, k)
+        if simplified is not None:
+            return simplified
+
+        v = self.operand(val, 0, True)
+        inverted = (k in ("z", "hz"))
+        rel = self._invert_or_simplify_relational(v, inverted)
+        if rel is not None:
+            return rel
+
         if k == "z":
             return "%s == 0" % v
         if k == "nz":
@@ -1504,18 +1760,36 @@ def _params(func, arity_of=None):
     Arity therefore comes from the *highest* argument register with a real
     use, and every register below it is a parameter too.
     """
+    # Check if this function itself is variadic (>= 16 arg register spills)
+    var_spills = sum(1 for i in func.insns()
+                     if i.op == Op.STOREQ and len(i.srcs) >= 3
+                     and i.srcs[2].is_var and i.srcs[2].ver == 0 and 4 <= i.srcs[2].reg <= 79)
+    if var_spills >= 16:
+        # Variadic function: only r3 (format string) plus registers with non-STOREQ uses
+        hi = regs.ARG_FIRST
+        for insn in func.insns():
+            if insn.op in (Op.PHI, Op.STOREQ) or insn.op in ABI_OPS:
+                continue
+            for u in insn.uses():
+                if u.ver == 0 and regs.ARG_FIRST <= u.reg <= regs.ARG_LAST:
+                    hi = max(hi, u.reg)
+        return list(range(regs.ARG_FIRST, hi + 1))
+
     hi = None
     real = _real_uses(func)
     for insn in func.insns():
         if insn.op == Op.PHI:
             continue
         if insn.op in ABI_OPS:
-            # A call's operand list names every argument register, so it says
-            # nothing on its own -- *unless* the callee's arity is known, in
-            # which case the operands within that arity really are arguments.
-            # That is what catches a parameter this function only forwards.
             if arity_of is None or insn.op not in (Op.CALL, Op.ICALL):
                 continue
+            if insn.op == Op.CALL and insn.aux is not None:
+                try:
+                    from . import is_variadic
+                    if is_variadic(insn.aux):
+                        continue
+                except Exception:
+                    pass
             n = arity_of(insn.aux) if insn.op == Op.CALL else None
             if not n:
                 continue
@@ -1531,14 +1805,32 @@ def _params(func, arity_of=None):
                 hi = u.reg if hi is None else max(hi, u.reg)
     if hi is None:
         return []
+    if hi > regs.ARG_FIRST + 7:
+        hi = regs.ARG_FIRST + 7
     return list(range(regs.ARG_FIRST, hi + 1))
 
 
 def _signature(g, func):
-    """Return type and parameter list, from the recovered types."""
+    """Return type and parameter list, from user override or recovered types."""
+    if g.user_proto:
+        from . import abi
+        parsed = abi._parse_proto(g.user_proto, func.name or ("sub_%X" % func.start_ea))
+        if parsed is not None:
+            if parsed.params:
+                plist = []
+                for p in parsed.params:
+                    eff_name = g.user_renames.get(p.name, p.name)
+                    eff_type = g.user_types.get(p.name, g.user_types.get(eff_name, p.type_str))
+                    sep = "" if eff_type.endswith("*") else " "
+                    plist.append(f"{eff_type}{sep}{eff_name}")
+                return parsed.ret_type, ", ".join(plist)
+            else:
+                return parsed.ret_type, "void"
+
     plist = []
     for r in g.params:
-        nm = g.param_name[r]
+        raw_nm = g.param_name[r]
+        nm = g.user_renames.get(raw_nm, raw_nm)
         # The implicit `this` is a pointer to the class, whatever demand
         # analysis made of r3 (it is usually only forwarded, so it types as a
         # bare word); the name says what it points at.
@@ -1547,28 +1839,41 @@ def _signature(g, func):
             continue
         ty = g.types.of((r, 0)) if g.types is not None else None
         ct = g.ctype(ty)
+        ct = g.user_types.get(raw_nm, g.user_types.get(nm, ct))
         plist.append("%s%s%s" % (ct, "" if ct.endswith("*") else " ", nm))
 
-    # The return type is whatever r3 holds where the function returns.
-    ret = "void"
-    for insn in func.insns():
-        if insn.op != Op.RET:
-            continue
-        for s in insn.srcs:
-            if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
-                ret = g.ctype(g.type_of(s), "qword")
-                break
+    # The return type is whatever r3 holds where the function returns, or user override
+    if "__return__" in g.user_types:
+        ret = g.user_types["__return__"]
+    else:
+        ret = "void"
+        for insn in func.insns():
+            if insn.op != Op.RET:
+                continue
+            for s in insn.srcs:
+                if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
+                    ret = g.ctype(g.type_of(s), "qword")
+                    break
     return ret, (", ".join(plist) or "void")
 
 
 def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
-             stk_of=None, this_of=None, sym_of=None):
+             stk_of=None, this_of=None, sym_of=None,
+             user_renames=None, user_types=None, user_proto=None):
     """Render the structured AST as pseudocode lines."""
-    g = CGen(func, name_of, arity_of, str_of, stk_of, this_of, sym_of)
-    name = func.name or "sub_%X" % func.start_ea
+    g = CGen(func, name_of, arity_of, str_of, stk_of, this_of, sym_of,
+             user_renames=user_renames, user_types=user_types, user_proto=user_proto)
+    raw_name = func.name or "sub_%X" % func.start_ea
+    if g.user_proto:
+        from . import abi
+        parsed = abi._parse_proto(g.user_proto, raw_name)
+        if parsed and parsed.name and parsed.name != "sub_unknown":
+            raw_name = parsed.name
+    name = g.user_renames.get(raw_name, raw_name)
     ret, params = _signature(g, func)
 
-    out = ["// %s  @ 0x%X" % (name, func.start_ea)]
+    out = CodeLines()
+    out.append("// %s  @ 0x%X" % (name, func.start_ea))
     sc = getattr(func, "scalar_stats", {}) or {}
     if sc:
         out.append("// scalarised: %d stores, %d loads, %d scalar ops"
@@ -1602,6 +1907,7 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
         out.append("// parameters: %s"
                    % "  ".join("%s = %s" % (g.param_name[r], regs.reg_name(r))
                                for r in g.params))
+    proto_lineno = len(out)
     sep = "" if ret.endswith("*") else " "
     out.append("%s%s%s(%s)" % (ret, sep, name, params))
     out.append("{")
@@ -1617,10 +1923,68 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
             note += ("; %d stack address(es) did not resolve to a slot and "
                      "are assumed not to alias one" % g.stack_unresolved)
         out.insert(stack_note_at, note)
+        proto_lineno += 1
     decls = g.declarations()
     if decls:
         out.extend(decls)
         out.append("")
+    header_count = len(out)
+    out.header_count = header_count
     out.extend(body)
     out.append("}")
+
+    out.line_eas = [None] * header_count + g.body_eas + [None]
+    out.line_to_eas = {header_count + k: v for k, v in g.body_line_to_eas.items()}
+    out.ea_to_line = {}
+    for lineno, eas in out.line_to_eas.items():
+        for ea in eas:
+            if ea not in out.ea_to_line:
+                out.ea_to_line[ea] = lineno
+
+    # Map function prototype and header lines to func.start_ea
+    if func.start_ea not in out.ea_to_line:
+        out.ea_to_line[func.start_ea] = proto_lineno
+    for h_line in range(proto_lineno, header_count):
+        if func.start_ea not in out.line_to_eas.setdefault(h_line, []):
+            out.line_to_eas[h_line].append(func.start_ea)
+        if h_line < len(out.line_eas) and out.line_eas[h_line] is None:
+            out.line_eas[h_line] = func.start_ea
+
+    # Dense instruction completion across all basic blocks in func
+    if getattr(func, "blocks", None):
+        sorted_blocks = sorted(func.blocks, key=lambda b: b.start_ea)
+        for b in sorted_blocks:
+            b_lines = []
+            for ins in b.insns:
+                if ins.ea in out.ea_to_line:
+                    b_lines.append((ins.ea, out.ea_to_line[ins.ea]))
+            for ins in b.insns:
+                if ins.ea in out.ea_to_line:
+                    continue
+                chosen_line = None
+                if b_lines:
+                    _, chosen_line = min(b_lines, key=lambda pair: abs(pair[0] - ins.ea))
+                elif b.start_ea in out.ea_to_line:
+                    chosen_line = out.ea_to_line[b.start_ea]
+                else:
+                    chosen_line = proto_lineno if proto_lineno >= 0 else 0
+                if chosen_line is not None:
+                    out.ea_to_line[ins.ea] = chosen_line
+                    if ins.ea not in out.line_to_eas.setdefault(chosen_line, []):
+                        out.line_to_eas[chosen_line].append(ins.ea)
+
+    try:
+        import ida_funcs, idautils
+        pfn = ida_funcs.get_func(func.start_ea)
+        if pfn:
+            for item_ea in idautils.FuncItems(pfn.start_ea):
+                if item_ea not in out.ea_to_line:
+                    if out.ea_to_line:
+                        closest_ea = min(out.ea_to_line.keys(), key=lambda e: abs(e - item_ea))
+                        chosen = out.ea_to_line[closest_ea]
+                        out.ea_to_line[item_ea] = chosen
+                        out.line_to_eas.setdefault(chosen, []).append(item_ea)
+    except Exception:
+        pass
+
     return out

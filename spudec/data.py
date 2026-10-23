@@ -426,12 +426,24 @@ class Symbols(object):
         try:
             import ida_bytes
             import ida_name
+            import ida_segment
         except ImportError:
             return None
-        if ea <= 0 or not ida_bytes.is_loaded(ea):
+        if ea <= 0:
+            return None
+        seg = ida_segment.getseg(ea)
+        if seg is None and not ida_bytes.is_loaded(ea):
             return None
         raw = ida_name.get_name(ea)
-        if not raw or ida_bytes.has_dummy_name(ida_bytes.get_flags(ea)):
+        if not raw:
+            head = ida_bytes.get_item_head(ea)
+            if head != ea and (ida_segment.getseg(head) is not None or ida_bytes.is_loaded(head)):
+                hname = ida_name.get_name(head)
+                if hname and not hname.startswith("loc_"):
+                    off = ea - head
+                    return "%s + 0x%X" % (demangle(hname) or hname, off)
+            return None
+        if raw.startswith("loc_"):
             return None
         if raw.startswith("_ZTV"):
             d = ida_name.demangle_name(raw, ida_name.MNG_NODEFINIT)

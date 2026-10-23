@@ -110,7 +110,7 @@ class StackVars(object):
             op = insn.ops[n]
             if op.type == ida_ua.o_void:
                 break
-            if op.type != ida_ua.o_displ:
+            if op.type not in (ida_ua.o_displ, ida_ua.o_imm):
                 continue
             soff = ida_frame.calc_stkvar_struc_offset(pfn, insn, n)
             if soff == BADADDR:

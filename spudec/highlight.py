@@ -102,7 +102,7 @@ def _ident_color(text, line, after):
     if base in C_TYPES or base.startswith("vec_"):
         return ida_lines.SCOLOR_TYPE
     if base.startswith("loc_") or base.startswith("def_") \
-            or base.startswith("jpt_"):
+            or base.startswith("jpt_") or base.startswith("sub_"):
         return ida_lines.SCOLOR_CREFTAIL
     # An identifier followed by '(' is being called.  This also picks up the
     # vector intrinsics (`shufb(`, `add.w(`), which is what we want: they are

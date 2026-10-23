@@ -73,67 +73,116 @@ def dump(ea, **kw):
     return decompile(ea, **kw).dump()
 
 
+_VARIADIC_CACHE = {}
+
+
+def is_variadic(ea):
+    """Whether the function at ea is a variadic (printf/log) function."""
+    if ea in _VARIADIC_CACHE:
+        return _VARIADIC_CACHE[ea]
+    res = False
+    try:
+        from .ir import Op
+        func = decompile(ea, scalarize=False)
+        count = sum(1 for i in func.insns()
+                    if i.op == Op.STOREQ and len(i.srcs) >= 3
+                    and i.srcs[2].is_var and i.srcs[2].ver == 0 and 4 <= i.srcs[2].reg <= 79)
+        res = (count >= 16)
+    except Exception:
+        res = False
+    _VARIADIC_CACHE[ea] = res
+    return res
+
+
 _ARITY_CACHE = {}
 _ARITY_ACTIVE = set()
-_ARITY_CUTS = 0        # cycles cut while answering the current query
 
 
 def clear_arity_cache():
     """Forget recovered arities -- call after changing function boundaries."""
     _ARITY_CACHE.clear()
     _ARITY_ACTIVE.clear()
-    global _ARITY_CUTS
-    _ARITY_CUTS = 0
+
+
+def _thunk_target(ea):
+    try:
+        import idautils, ida_ua, ida_funcs
+        items = list(idautils.FuncItems(ea))
+        if len(items) == 1:
+            mnem = ida_ua.print_insn_mnem(ea)
+            if mnem in ("br", "bra"):
+                for xref in idautils.CodeRefsFrom(ea, False):
+                    f = ida_funcs.get_func(xref)
+                    if f and f.start_ea != ea:
+                        return f.start_ea
+    except Exception:
+        pass
+    return None
 
 
 def arity_of(ea):
     """
     How many parameters the function at ``ea`` takes, or None if unknown.
 
-    Needed to show a call's arguments: the operand list of a call names every
-    argument register because a callee *might* read them, so only the callee
-    itself can say how many of those are real.
-
-    Demand-driven and recursive: working out one function's arity consults its
-    own callees, so a parameter that is merely forwarded down a chain is still
-    recovered.  Recursion terminates on an in-progress set rather than by
-    caching a placeholder -- caching one would make the answer depend on which
-    function happened to be asked about first.  Memoisation keeps the total
-    work linear in the number of functions.
-
-    The cache is keyed on address, so clear it if function boundaries change.
+    Checked in order:
+    1. User prototype override from netnode / db.
+    2. IDA type info (tinfo_t).
+    3. Thunk/trampoline target resolution.
+    4. Shallow parameter recovery over the function's own body.
     """
-    global _ARITY_CUTS
     if ea in _ARITY_CACHE:
         return _ARITY_CACHE[ea]
     if ea in _ARITY_ACTIVE:
-        # A cycle.  Report "unknown" for this query and record that the answer
-        # now being computed rests on a cut edge.
-        _ARITY_CUTS += 1
         return None
 
-    cuts_before = _ARITY_CUTS
     _ARITY_ACTIVE.add(ea)
+    n = None
     try:
+        from . import db
+        data = db.get_func_data(ea)
+        if data.get('proto'):
+            from .abi import _parse_proto
+            sig = _parse_proto(data['proto'], 'fn')
+            if sig:
+                n = len(sig.params)
+                _ARITY_CACHE[ea] = n
+                return n
+
+        try:
+            import ida_typeinf
+            tif = ida_typeinf.tinfo_t()
+            try:
+                import ida_nalt
+                ok = ida_nalt.get_tinfo(tif, ea)
+            except Exception:
+                ok = ida_typeinf.get_tinfo(tif, ea)
+            if ok and tif.is_func():
+                n = tif.get_nargs()
+                _ARITY_CACHE[ea] = n
+                return n
+        except Exception:
+            pass
+
+        thunk_tgt = _thunk_target(ea)
+        if thunk_tgt is not None and thunk_tgt != ea:
+            n = arity_of(thunk_tgt)
+            _ARITY_CACHE[ea] = n
+            return n
+
         import ida_funcs
         f = ida_funcs.get_func(ea)
         if f is None or f.start_ea != ea:
             return None
         from . import cgen
         func = decompile(ea, scalarize=False)
-        n = len(cgen._params(func, arity_of))
+        params = cgen._params(func, arity_of=None)
+        n = len(params)
     except Exception:
-        return None
+        n = None
     finally:
         _ARITY_ACTIVE.discard(ea)
 
-    # Only cache an answer that did not depend on a cut cycle.  A result
-    # computed while some caller up the stack was still in progress is a
-    # *lower bound*, not the answer -- caching it would freeze in whatever
-    # the traversal order happened to produce, and the same function would
-    # then get different signatures depending on what was decompiled first.
-    if _ARITY_CUTS == cuts_before:
-        _ARITY_CACHE[ea] = n
+    _ARITY_CACHE[ea] = n
     return n
 
 
@@ -175,7 +224,7 @@ def param_demand(ea):
         if f is None or f.start_ea != ea:
             return wide
         func = decompile(ea, scalarize=False)
-        dem = lanes.compute_demand(func, callee=param_demand)
+        dem = lanes.compute_demand(func, callee=None)
         out = {}
         for r in range(regs.ARG_FIRST, regs.ARG_LAST + 1):
             out[r] = dem.get((r, 0), lanes.NONE)
