@@ -486,9 +486,9 @@ _EW_SIGNIFICANT = frozenset((
 INFIX = {
     Op.ADD: "+", Op.SUB: "-", Op.MUL: "*", Op.MPY: "*", Op.MPYU: "*",
     Op.AND: "&", Op.OR: "|", Op.XOR: "^",
-    Op.SHL: "<<", Op.SHR: ">>", Op.SAR: ">>s", Op.ROL: "<<<",
-    Op.CMPEQ: "==", Op.CMPGT: ">s", Op.CMPGTU: ">u",
-    Op.FADD: "+.", Op.FSUB: "-.", Op.FMUL: "*.",
+    Op.SHL: "<<", Op.SHR: ">>", Op.SAR: ">>", Op.ROL: "<<<",
+    Op.CMPEQ: "==", Op.CMPGT: ">", Op.CMPGTU: ">",
+    Op.FADD: "+", Op.FSUB: "-", Op.FMUL: "*",
 }
 
 

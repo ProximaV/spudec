@@ -309,4 +309,8 @@ def narrowest(mask, table=LEAD):
     for ew in (EW.B, EW.H, EW.W, EW.D):
         if fits(mask, ew, table):
             return ew
+    if table is LEAD:
+        for ew in (EW.B, EW.H, EW.W, EW.D):
+            if fits(mask, ew, SLOT_LOW):
+                return ew
     return None

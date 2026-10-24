@@ -230,7 +230,16 @@ def _inlinable(func, call_args=None, debris=None):
             defs[d.key()] = insn
         if d is not None and d.key() in debris:
             continue
-        for u in insn.uses():
+        if insn.op == Op.RET:
+            real_srcs = [s for s in insn.srcs if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0]
+        elif insn.op in (Op.CALL, Op.ICALL):
+            n_real = ABI_OPS.get(insn.op, 0)
+            real_srcs = [s for s in insn.srcs[:n_real] if s.is_var] + list(call_args.get(id(insn), []))
+        else:
+            real_srcs = insn.uses()
+        for u in real_srcs:
+            if not u.is_var:
+                continue
             k = u.key()
             use_count[k] = use_count.get(k, 0) + 1
             use_site[k] = insn
@@ -587,7 +596,29 @@ class CGen(object):
                 return "&" + eff_base + " + " + off
             eff_sym = self.user_renames.get(sym, sym)
             return "&" + eff_sym
-        return c.scalar_str() if scalar else str(c)
+        if c.val == 0:
+            return "0"
+        for cand in (EW.W, EW.H, EW.B, EW.D):
+            bits = int(cand) * 8
+            n = 16 // int(cand)
+            lane = c.val >> (128 - bits)
+            if all(((c.val >> (128 - bits * (i + 1))) & ((1 << bits) - 1)) == lane
+                   for i in range(n)):
+                if cand == EW.W:
+                    if lane >= 0x80000000 and (0x100000000 - lane) <= 0xFFFF:
+                        return "-0x%X" % (0x100000000 - lane)
+                    return "0x%X" % lane
+                elif cand == EW.D:
+                    if lane >= 0x8000000000000000 and (0x10000000000000000 - lane) <= 0xFFFF:
+                        return "-0x%X" % (0x10000000000000000 - lane)
+                    return "0x%X" % lane
+                else:
+                    return "0x%X" % lane
+        if scalar:
+            return c.scalar_str()
+        if (c.val & ((1 << 96) - 1)) == 0:
+            return c.scalar_str()
+        return "0x%032X" % c.val
 
     def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
                 strings=True):
@@ -782,6 +813,274 @@ class CGen(object):
                 return "(int)(short)%s" % arg
             if insn.ew == EW.D:
                 return "(long long)(int)%s" % arg
+
+        if op == Op.SELB and len(insn.srcs) == 3:
+            rc_var = insn.srcs[2]
+            if rc_var.is_var and rc_var.key() in self.defs:
+                d = self.defs[rc_var.key()]
+                if d.op == Op.FSM and len(d.srcs) == 1:
+                    rc_var = d.srcs[0]
+            ra = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+            rb = self.operand(insn.srcs[1], depth, sc, want_scalar=True)
+            rc = self.operand(rc_var, depth, sc, want_scalar=True)
+            cond = rc.strip()
+            if not (cond.startswith("(") and cond.endswith(")")) and (" " in cond):
+                cond = "(%s)" % cond
+            text = "%s ? %s : %s" % (cond, rb, ra)
+            return text if top else "(%s)" % text
+
+        if op == Op.FSM and len(insn.srcs) == 1:
+            arg = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            if not arg.isidentifier() and not (arg.startswith("(") and arg.endswith(")")):
+                arg = "(%s)" % arg
+            text = "%s ? -1 : 0" % arg
+            return text if top else "(%s)" % text
+
+        if op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU) and len(insn.srcs) == 2:
+            if op in (Op.CMPGT, Op.CMPGTU) and insn.srcs[1].is_const and (insn.srcs[1].val >> 96) in (0xB, 0xF):
+                lhs_op = insn.srcs[0]
+                if lhs_op.is_var and lhs_op.key() in self.defs:
+                    gb_insn = self.defs[lhs_op.key()]
+                    if gb_insn.op == Op.GB and len(gb_insn.srcs) == 1:
+                        cmp_op = gb_insn.srcs[0]
+                        if cmp_op.is_var and cmp_op.key() in self.defs:
+                            cmp_insn = self.defs[cmp_op.key()]
+                            if cmp_insn.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_insn.srcs) == 2:
+                                lhs = self.operand(cmp_insn.srcs[0], depth, True, want_scalar=True)
+                                rhs = self.operand(cmp_insn.srcs[1], depth, True, want_scalar=True)
+                                text = "%s == %s" % (lhs, rhs)
+                                return text if top else "(%s)" % text
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            sym = "==" if op == Op.CMPEQ else ">"
+            text = "%s %s %s" % (lhs, sym, rhs)
+            return text if top else "(%s)" % text
+
+        if op == Op.GB and len(insn.srcs) == 1:
+            arg = insn.srcs[0]
+            if arg.is_var and arg.key() in self.defs:
+                d = self.defs[arg.key()]
+                if d.op in (Op.CMPEQ, Op.FCMPEQ, Op.CMPGT, Op.CMPGTU):
+                    return self.rhs(d, depth, top=top, want_scalar=True)
+
+        if op in (Op.QSHLBY, Op.QROTMBY, Op.QSHLBI, Op.QROTMBI) and len(insn.srcs) == 2:
+            val_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+            if insn.srcs[1].is_const:
+                cnt = insn.srcs[1].val >> 96
+                if op == Op.QSHLBY:
+                    if cnt == 4:
+                        if not val_str.isidentifier() and not (val_str.startswith("(") and val_str.endswith(")")):
+                            val_str = "(%s)" % val_str
+                        return "(u32)%s" % val_str
+                    else:
+                        bits = cnt * 8
+                        text = "%s << %d" % (val_str, bits)
+                        return text if top else "(%s)" % text
+                elif op == Op.QROTMBY:
+                    k = (-cnt) & 0x1F
+                    bits = k * 8
+                    text = "%s >> %d" % (val_str, bits)
+                    return text if top else "(%s)" % text
+                elif op == Op.QSHLBI:
+                    text = "%s << %d" % (val_str, cnt)
+                    return text if top else "(%s)" % text
+                elif op == Op.QROTMBI:
+                    text = "%s >> %d" % (val_str, cnt)
+                    return text if top else "(%s)" % text
+            else:
+                cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+                if op == Op.QSHLBY:
+                    text = "%s << (%s * 8)" % (val_str, cnt_str)
+                elif op == Op.QROTMBY:
+                    text = "%s >> (%s * 8)" % (val_str, cnt_str)
+                elif op == Op.QSHLBI:
+                    text = "%s << %s" % (val_str, cnt_str)
+                elif op == Op.QROTMBI:
+                    text = "%s >> %s" % (val_str, cnt_str)
+                return text if top else "(%s)" % text
+
+        if op == Op.SHUFB and len(insn.srcs) == 3:
+            mask_str = self.operand(insn.srcs[2], depth, False)
+            if ("xmmword_232A0" in mask_str or "xmmword_232B0" in mask_str) or (
+                    insn.srcs[0].is_var and insn.srcs[1].is_var and insn.srcs[0].key() == insn.srcs[1].key()
+                    and ("232A0" in mask_str or "232B0" in mask_str)):
+                ra_str = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+                if not ra_str.isidentifier() and not (ra_str.startswith("(") and ra_str.endswith(")")):
+                    ra_str = "(%s)" % ra_str
+                return "(u32)%s" % ra_str
+            if (insn.srcs[2].is_const and (insn.srcs[2].val & 0xFFFFFFFF) == 0x00010203) or "10203" in mask_str:
+                return self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+            if "233B0" in mask_str:
+                ra_str = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+                return "__builtin_bswap32(%s)" % ra_str
+            if "239D0" in mask_str:
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                b_str = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                text = "(%s << 32) | (%s >> 96)" % (a_str, b_str)
+                return text if top else "(%s)" % text
+            if "237B0" in mask_str or "239B0" in mask_str:
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                b_str = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                text = "(%s << 64) | (%s >> 64)" % (a_str, b_str)
+                return text if top else "(%s)" % text
+            if any(k in mask_str for k in ("237C0", "237D0", "237E0", "237F0")):
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                return "aes_shift_rows(%s)" % a_str
+            if any(k in mask_str for k in ("23910", "23920", "23930", "23940")):
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                return "aes_inv_shift_rows(%s)" % a_str
+            if insn.srcs[2].is_var and insn.srcs[2].key() in self.defs:
+                c_insn = self.defs[insn.srcs[2].key()]
+                if c_insn.op == Op.GENCTL:
+                    val_s = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+                    old_s = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                    c_addr = self.operand(c_insn.srcs[0], depth, True, want_scalar=True)
+                    if c_insn.ew == EW.W:
+                        return "vec_insert_w(%s, %s, (%s & 0xF) / 4)" % (val_s, old_s, c_addr)
+                    elif c_insn.ew == EW.H:
+                        return "vec_insert_h(%s, %s, (%s & 0xF) / 2)" % (val_s, old_s, c_addr)
+                    else:
+                        return "vec_insert_b(%s, %s, %s & 0xF)" % (val_s, old_s, c_addr)
+            a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+            b_str = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+            m_str = self.operand(insn.srcs[2], depth, False)
+            return "__builtin_shuffle(%s, %s, %s)" % (a_str, b_str, m_str)
+
+        if op == Op.CLZ and len(insn.srcs) >= 1:
+            arg = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+            return "__builtin_clz(%s)" % arg
+
+        if op == Op.CG and len(insn.srcs) == 2:
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "((u64)(u32)%s + (u32)%s > 0xFFFFFFFF)" % (lhs, rhs)
+            return text if top else "(%s)" % text
+
+        if op == Op.BG and len(insn.srcs) == 2:
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "(u32)%s < (u32)%s" % (lhs, rhs)
+            return text if top else "(%s)" % text
+
+        if op == Op.CGX and len(insn.srcs) == 3:
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            c = self.operand(insn.srcs[2], depth, True, want_scalar=True)
+            text = "((u64)(u32)%s + (u32)%s + (%s & 1) > 0xFFFFFFFF)" % (lhs, rhs, c)
+            return text if top else "(%s)" % text
+
+        if op == Op.BGX and len(insn.srcs) == 3:
+            lhs = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            c = self.operand(insn.srcs[2], depth, True, want_scalar=True)
+            text = "((u64)(u32)%s < (u32)%s + (%s & 1))" % (lhs, rhs, c)
+            return text if top else "(%s)" % text
+
+        if op in (Op.ROTM, Op.ROTMA, Op.ROL) and len(insn.srcs) == 2:
+            val = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
+            if not val.isidentifier() and not (val.startswith("(") and val.endswith(")")):
+                val = "(%s)" % val
+            if insn.srcs[1].is_const:
+                cnt_val = (insn.srcs[1].val >> 96) & 0xFFFFFFFF
+                k = cnt_val if cnt_val < 0x80000000 else cnt_val - 0x100000000
+                if k <= 0:
+                    shift = (-k) & 31
+                    if op == Op.ROTMA:
+                        text = "(int)%s >> %d" % (val, shift)
+                    else:
+                        text = "%s >> %d" % (val, shift)
+                else:
+                    text = "_rotl(%s, %d)" % (val, k & 31)
+                return text if top else "(%s)" % text
+            else:
+                cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+                if cnt_str.startswith("(0 - ") and cnt_str.endswith(")"):
+                    inner = cnt_str[5:-1].strip()
+                    if op == Op.ROTMA:
+                        text = "(int)%s >> %s" % (val, inner)
+                    else:
+                        text = "%s >> %s" % (val, inner)
+                    return text if top else "(%s)" % text
+                elif cnt_str.startswith("-"):
+                    inner = cnt_str[1:].strip()
+                    if op == Op.ROTMA:
+                        text = "(int)%s >> %s" % (val, inner)
+                    else:
+                        text = "%s >> %s" % (val, inner)
+                    return text if top else "(%s)" % text
+                if op == Op.ROL:
+                    text = "_rotl(%s, %s)" % (val, cnt_str)
+                elif op == Op.ROTMA:
+                    text = "(int)%s >> %s" % (val, cnt_str)
+                else:
+                    text = "%s >> %s" % (val, cnt_str)
+                return text if top else "(%s)" % text
+
+        if op == Op.QROTBI and len(insn.srcs) == 2:
+            val = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+            if insn.srcs[1].is_const:
+                cnt = (insn.srcs[1].val >> 96) & 0x7F
+                text = "_rotl(%s, %d)" % (val, cnt)
+            else:
+                cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+                text = "_rotl(%s, %s)" % (val, cnt_str)
+            return text if top else "(%s)" % text
+
+        if op == Op.QROTBY and len(insn.srcs) == 2:
+            val = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+            if insn.srcs[1].is_const:
+                cnt = (insn.srcs[1].val >> 96) & 0xF
+                bits = cnt * 8
+                text = "_rotl(%s, %d)" % (val, bits)
+            else:
+                cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+                text = "_rotl(%s, (%s) * 8)" % (val, cnt_str)
+            return text if top else "(%s)" % text
+
+        if op == Op.MPYH and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "((u32)(%s >> 16) * (u16)%s) << 16" % (a, b)
+            return text if top else "(%s)" % text
+
+        if op == Op.MPYHHU and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "((u32)%s >> 16) * ((u32)%s >> 16)" % (a, b)
+            return text if top else "(%s)" % text
+
+        if op == Op.MPYHH and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "((int)%s >> 16) * ((int)%s >> 16)" % (a, b)
+            return text if top else "(%s)" % text
+
+        if op == Op.MPYU and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            text = "(u16)%s * (u16)%s" % (a, b)
+            return text if top else "(%s)" % text
+
+        if op in (Op.MPY, Op.MUL) and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            if op == Op.MUL or insn.ew == EW.W:
+                text = "%s * %s" % (a, b)
+            else:
+                text = "(short)%s * (short)%s" % (a, b)
+            return text if top else "(%s)" % text
+
+        if insn.ew == EW.H and op in (Op.ADD, Op.SUB, Op.SHL, Op.SHR, Op.SAR) and len(insn.srcs) == 2:
+            a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
+            sym = {Op.ADD: "+", Op.SUB: "-", Op.SHL: "<<", Op.SHR: ">>", Op.SAR: ">>"}[op]
+            cast = "(short)" if op == Op.SAR else "(u16)"
+            text = "%s(%s %s %s)" % (cast, a, sym, b)
+            return text if top else "(%s)" % text
+
+        if op == Op.GENCTL and len(insn.srcs) >= 1:
+            addr_str = self.operand(insn.srcs[0], depth, True, want_scalar=True)
+            return "__builtin_spu_mask(%s)" % addr_str
 
         name = OP_NAME.get(op, "op%d" % int(op))
         if op in _EW_CALLS:
@@ -1014,12 +1313,20 @@ class CGen(object):
         d = insn.defines()
         if d is None:
             return None
-        hit = self._slots.get(addr_expr(d, self.defs)[:2])
+        base, off, _ = addr_expr(d, self.defs)
+        slot_base = off & ~0xF
+        byte_off = off & 0xF
+        hit = self._slots.get((base, slot_base))
         if hit is None:
-            return None
+            hit = self._slots.get((base, off))
+            if hit is None:
+                return None
+            byte_off = 0
         self.stack_decls[hit[0]] = hit[1]
         eff_hit = self.user_renames.get(hit[0], hit[0])
-        return "&" + eff_hit
+        if byte_off == 0:
+            return "&" + eff_hit
+        return "(char *)&%s + %d" % (eff_hit, byte_off)
 
     def _stack_name(self, insn):
         """
@@ -1033,15 +1340,25 @@ class CGen(object):
         if not self._slots or len(insn.srcs) < 2:
             return None
         from .scalarize import addr_expr
-        hit = self._slots.get(addr_expr(insn.srcs[1], self.defs)[:2])
+        base, off, _ = addr_expr(insn.srcs[1], self.defs)
+        slot_base = off & ~0xF
+        byte_off = off & 0xF
+        hit = self._slots.get((base, slot_base))
         if hit is None:
-            return None
+            hit = self._slots.get((base, off))
+            if hit is None:
+                return None
+            byte_off = 0
         name, ct, ew = hit
         self.stack_decls[name] = ct
         eff_name = self.user_renames.get(name, name)
-        if insn.ew == ew:
-            return eff_name
-        return "*(%s *)&%s" % (self._access_type(insn), eff_name)
+        t = self._access_type(insn)
+        if byte_off == 0:
+            if insn.ew == ew:
+                return eff_name
+            return "*(%s *)&%s" % (t, eff_name)
+        else:
+            return "*((%s *)&%s + %d)" % (t, eff_name, byte_off)
 
     def _deref(self, insn, depth=0):
         """
@@ -1294,12 +1611,13 @@ class CGen(object):
                          if self.arity_of is not None and insn.aux is not None
                          else None)
                     keep += (call_arguments(insn, n) or []) if n is not None \
-                        else list(insn.srcs)              # unknown: keep all
+                        else [s for s in insn.srcs if s.is_var and s.key() not in roots]
                 elif op in (Op.ICALL, Op.IJMP):
-                    keep += list(insn.srcs)               # callee/target opaque
+                    keep += [s for s in insn.srcs if s.is_var and s.key() not in roots]
                 elif op == Op.RET:
                     keep += [s for s in insn.srcs if s.is_var
-                             and s.reg == regs.ARG_FIRST and s.ver != 0]
+                             and s.reg == regs.ARG_FIRST and s.ver != 0
+                             and s.key() not in roots]
                 return keep
             if op.has_side_effects or op.is_terminator:
                 return insn.srcs
@@ -1338,7 +1656,7 @@ class CGen(object):
         # dead `r5 = #0x2e698:w4` the call's operand list still pins.  A dead
         # constant or unused stack address computation read by nothing real
         # carries no information wherever it sits, so drop those too.
-        cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD)}
+        cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD, Op.MOV)}
 
         # 3. Arithmetic carry/borrow idioms feeding ADDX/SUBX.
         uses_of = {}
@@ -1379,8 +1697,34 @@ class CGen(object):
                 if d is None:
                     continue
                 users = uses_of.get(d.key(), [])
-                if all(id(u) in all_carry_ops for u in users):
+                real_users = [u for u in users if u.op not in ABI_OPS and u.op != Op.PHI]
+                if all(id(u) in all_carry_ops for u in real_users):
                     cone.add(d.key())
+
+        # 4. Condition chains feeding branches (Op.CJMP, Op.CIJMP)
+        for insn in self.func.insns():
+            if insn.op in (Op.CJMP, Op.CIJMP):
+                cur = insn.srcs[0]
+                chain = []
+                while cur.is_var and cur.key() in defs:
+                    d = defs[cur.key()]
+                    if d.op in (Op.MOV, Op.EXTS):
+                        chain.append(d)
+                        cur = d.srcs[0]
+                    elif d.op in (Op.CMPGT, Op.CMPGTU) and len(d.srcs) == 2 and d.srcs[1].is_const and (d.srcs[1].val >> 96) in (0xB, 0xF):
+                        chain.append(d)
+                        cur = d.srcs[0]
+                    elif d.op == Op.GB and len(d.srcs) == 1:
+                        chain.append(d)
+                        cur = d.srcs[0]
+                    elif d.op in (Op.CMPEQ, Op.FCMPEQ, Op.CMPGT, Op.CMPGTU):
+                        chain.append(d)
+                        for x in chain:
+                            if x.defines() and x.defines().key() in dead:
+                                cone.add(x.defines().key())
+                        break
+                    else:
+                        break
 
         return cone
 
@@ -1404,12 +1748,7 @@ class CGen(object):
         if d is not None and d.key() in self.debris:
             return True
         if insn.op == Op.UNDEF:
-            # A clobber nothing real reads is noise; one in a return-value
-            # register at a call site does print, as `<result in rN>`.
-            if d.key() in self.mute:
-                return True
-            return not (insn.ea in self.call_at
-                        and regs.ARG_FIRST <= d.reg <= regs.ARG_LAST)
+            return True
         # The link value a `brsl` writes is the return address; the call is
         # printed on the next line and says the same thing more clearly.
         if (insn.op == Op.CONST and d.reg == regs.LR
@@ -1427,15 +1766,8 @@ class CGen(object):
         d = insn.defines()
         if d is not None and d.key() in self.inlinable:
             return None                       # printed at its use site
-        if op == Op.UNDEF and d is not None:
-            if self._suppressed(insn, d):
-                return None
-            # A clobber sitting on a call, in a register the ABI uses for
-            # return values (r3..r74), is the callee's result.  The call
-            # statement is printed immediately above, so naming the callee
-            # again on each line would read as several separate calls.
-            return "%s = <result in %s>;" % (self.nma(d),
-                                             regs.reg_name(d.reg))
+        if op == Op.UNDEF:
+            return None
         if d is not None and self._suppressed(insn, d):
             return None
         if op == Op.CIJMP:
@@ -1473,9 +1805,13 @@ class CGen(object):
         if op == Op.STOP:
             return "stop(%s);" % (insn.aux,)
         if op == Op.HALT:
-            return "halt_if(%s %s %s);" % (
-                self.operand(insn.srcs[0], 0, True), insn.aux,
-                self.operand(insn.srcs[1], 0, True))
+            cmp_sym = {
+                "eq": "==", "gt": ">", "ge": ">=",
+                "lt": "<", "le": "<=", "ne": "!=",
+            }.get(str(insn.aux), str(insn.aux))
+            lhs = self.operand(insn.srcs[0], 0, True, want_scalar=True)
+            rhs = self.operand(insn.srcs[1], 0, True, want_scalar=True)
+            return "if ( %s %s %s ) __builtin_trap();" % (lhs, cmp_sym, rhs)
         if op in (Op.CALL, Op.ICALL):
             text = self.rhs(insn)
             ret_var = self.call_return.get(id(insn))
@@ -1578,7 +1914,12 @@ class CGen(object):
                     txt = "%sgoto *%s;   // %s" % (pad, self.operand(st.insn.srcs[0], 0, True), kind)
                     self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
                 elif st.insn.op == Op.JMP:
-                    self._add_line(out, "%sgoto loc_%X;   // outside this function" % (pad, st.insn.aux), primary_ea=ea)
+                    target_name = self.name_of(st.insn.aux) if self.name_of else None
+                    if not target_name:
+                        target_name = "loc_%X" % st.insn.aux
+                    else:
+                        target_name = self.user_renames.get(target_name, target_name)
+                    self._add_line(out, "%sgoto %s;   // outside this function" % (pad, target_name), primary_ea=ea)
                 else:
                     txt = pad + self.rhs(st.insn) + ";"
                     self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
@@ -1607,6 +1948,46 @@ class CGen(object):
 
         if cur.is_var and cur.key() in self.defs:
             d = self.defs[cur.key()]
+            if d.op in (Op.CMPGT, Op.CMPGTU) and len(d.srcs) == 2 and d.srcs[1].is_const and (d.srcs[1].val >> 96) in (0xB, 0xF):
+                lhs_op = d.srcs[0]
+                if lhs_op.is_var and lhs_op.key() in self.defs:
+                    gb_insn = self.defs[lhs_op.key()]
+                    if gb_insn.op == Op.GB and len(gb_insn.srcs) == 1:
+                        cmp_op = gb_insn.srcs[0]
+                        if cmp_op.is_var and cmp_op.key() in self.defs:
+                            cmp_insn = self.defs[cmp_op.key()]
+                            if cmp_insn.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_insn.srcs) == 2:
+                                for x in (d, gb_insn, cmp_insn):
+                                    if getattr(x, "ea", None) is not None:
+                                        chain_eas.append(x.ea)
+                                    self._suppressed_call_undefs.add(id(x))
+                                for ch_insn in chain_insns:
+                                    self._suppressed_call_undefs.add(id(ch_insn))
+                                self._current_inlined_eas.extend(chain_eas)
+                                is_zero = (k in ("z", "hz"))
+                                lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True)
+                                rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True)
+                                op_sym = "!=" if is_zero else "=="
+                                return "%s %s %s" % (lhs, op_sym, rhs)
+
+            if d.op == Op.GB and len(d.srcs) == 1:
+                cmp_op = d.srcs[0]
+                if cmp_op.is_var and cmp_op.key() in self.defs:
+                    cmp_insn = self.defs[cmp_op.key()]
+                    if cmp_insn.op in (Op.CMPEQ, Op.FCMPEQ) and len(cmp_insn.srcs) == 2:
+                        for x in (d, cmp_insn):
+                            if getattr(x, "ea", None) is not None:
+                                chain_eas.append(x.ea)
+                            self._suppressed_call_undefs.add(id(x))
+                        for ch_insn in chain_insns:
+                            self._suppressed_call_undefs.add(id(ch_insn))
+                        self._current_inlined_eas.extend(chain_eas)
+                        is_zero = (k in ("z", "hz"))
+                        lhs = self.operand(cmp_insn.srcs[0], 0, True, want_scalar=True)
+                        rhs = self.operand(cmp_insn.srcs[1], 0, True, want_scalar=True)
+                        op_sym = "!=" if is_zero else "=="
+                        return "%s %s %s" % (lhs, op_sym, rhs)
+
             if d.op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.FCMPEQ, Op.FCMPGT) and len(d.srcs) == 2:
                 if getattr(d, "ea", None) is not None:
                     chain_eas.append(d.ea)
@@ -1667,6 +2048,17 @@ class CGen(object):
 
         v = self.operand(val, 0, True)
         inverted = (k in ("z", "hz"))
+        if "gb.w(" in v and ("> 0xB" in v or "> 11" in v or "> 0xb" in v):
+            idx0 = v.find("gb.w(") + 5
+            idx1 = v.find(")", idx0)
+            if idx1 > idx0:
+                inner = v[idx0:idx1].strip()
+                if inner.startswith("(") and inner.endswith(")"):
+                    inner = inner[1:-1].strip()
+                rel = self._invert_or_simplify_relational(inner, inverted)
+                if rel is not None:
+                    return rel
+                return "!(%s)" % inner if inverted else inner
         rel = self._invert_or_simplify_relational(v, inverted)
         if rel is not None:
             return rel
@@ -1682,8 +2074,11 @@ class CGen(object):
     def _return(self, insn):
         if insn.op == Op.STOP:
             return "stop(%s);" % (insn.aux,)
+        roots = getattr(self.func, "store_idiom_roots", ())
         for s in insn.srcs:
             if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
+                if s.key() in self.debris or s.key() in roots:
+                    continue
                 return "return %s;" % self.nm(s)
         return "return;"
 
@@ -1695,9 +2090,6 @@ _COUNT_OPS = frozenset((
 ))
 
 _EW_CALLS = frozenset((
-    Op.ADD, Op.SUB, Op.MUL, Op.CG, Op.BG, Op.ADDX, Op.SUBX, Op.CGX, Op.BGX,
-    Op.SHL, Op.SHR, Op.SAR, Op.ROL, Op.ROTM, Op.ROTMA,
-    Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.GB, Op.FSM, Op.GENCTL, Op.EXTS,
     Op.FADD, Op.FSUB, Op.FMUL, Op.FMA, Op.FMS, Op.FNMS, Op.FNMA,
     Op.FCMPEQ, Op.FCMPGT, Op.FCMPMEQ, Op.FCMPMGT,
 ))
@@ -1758,11 +2150,12 @@ def _returned_keys(func):
     :meth:`CGen._return`, which picks exactly these operands.
     """
     out = set()
+    roots = getattr(func, "store_idiom_roots", set())
     for insn in func.insns():
         if insn.op != Op.RET:
             continue
         for s in insn.srcs:
-            if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
+            if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0 and s.key() not in roots:
                 out.add(s.key())
                 break
     return out
