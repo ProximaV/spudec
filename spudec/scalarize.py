@@ -121,12 +121,42 @@ def addr_expr(v, defs, limit=16):
     return (cur.key() if cur.is_var else None, off & 0xFFFFFFFF, aligned)
 
 
-def _same_target(a, b):
+def _same_base(k1, k2, defs=None, depth=0):
+    if k1 == k2:
+        return True
+    if k1 is None or k2 is None or defs is None or depth > 4:
+        return False
+    while k1 in defs and defs[k1].op == Op.MOV and defs[k1].srcs[0].is_var:
+        k1 = defs[k1].srcs[0].key()
+    while k2 in defs and defs[k2].op == Op.MOV and defs[k2].srcs[0].is_var:
+        k2 = defs[k2].srcs[0].key()
+    if k1 == k2:
+        return True
+    d1 = defs.get(k1)
+    d2 = defs.get(k2)
+    if d1 is None or d2 is None:
+        return False
+    if d1.op == d2.op and d1.ew == d2.ew and len(d1.srcs) == len(d2.srcs):
+        if d1.op == Op.ADD:
+            a1, b1 = d1.srcs
+            a2, b2 = d2.srcs
+            def match_src(x, y):
+                if x.is_var and y.is_var:
+                    return _same_base(x.key(), y.key(), defs, depth + 1)
+                elif x.is_const and y.is_const:
+                    return x.val == y.val
+                return False
+            if (match_src(a1, a2) and match_src(b1, b2)) or (match_src(a1, b2) and match_src(b1, a2)):
+                return True
+    return False
+
+
+def _same_target(a, b, defs=None):
     """Two address expressions naming the same byte address."""
-    return a[0] == b[0] and a[1] == b[1]
+    return _same_base(a[0], b[0], defs) and a[1] == b[1]
 
 
-def _same_slot(a, b):
+def _same_slot(a, b, defs=None):
     """
     Same base, and the same byte position within a quadword.
 
@@ -136,7 +166,34 @@ def _same_slot(a, b):
     multiple of 16 and the byte position is therefore identical.  Requiring
     the two offsets to be *equal* misses every one of those.
     """
-    return a[0] == b[0] and (a[1] & 0xF) == (b[1] & 0xF)
+    if _same_base(a[0], b[0], defs) and (a[1] & 0xF) == (b[1] & 0xF):
+        return True
+    if defs is not None and a[0] is not None and b[0] is not None:
+        d1 = defs.get(a[0])
+        d2 = defs.get(b[0])
+        if d1 is not None and d2 is not None:
+            if d1.op == Op.ADD and d2.op == Op.ADD and d1.ew == EW.W and d2.ew == EW.W:
+                s1_0, s1_1 = d1.srcs
+                s2_0, s2_1 = d2.srcs
+                for idx1, base1 in ((s1_0, s1_1), (s1_1, s1_0)):
+                    for idx2, base2 in ((s2_0, s2_1), (s2_1, s2_0)):
+                        if idx1.is_var and idx2.is_var and _same_base(idx1.key(), idx2.key(), defs):
+                            if (base1.is_var and base1.reg == regs.SP) or (base2.is_var and base2.reg == regs.SP):
+                                if (a[1] & 0xF) == (b[1] & 0xF):
+                                    return True
+            if d1.op == Op.ADD and d1.ew == EW.W:
+                for idx, base in ((d1.srcs[0], d1.srcs[1]), (d1.srcs[1], d1.srcs[0])):
+                    if idx.is_var and _same_base(idx.key(), b[0], defs):
+                        if base.is_var and base.reg == regs.SP:
+                            if (a[1] & 0xF) == (b[1] & 0xF):
+                                return True
+            if d2.op == Op.ADD and d2.ew == EW.W:
+                for idx, base in ((d2.srcs[0], d2.srcs[1]), (d2.srcs[1], d2.srcs[0])):
+                    if idx.is_var and _same_base(idx.key(), a[0], defs):
+                        if base.is_var and base.reg == regs.SP:
+                            if (a[1] & 0xF) == (b[1] & 0xF):
+                                return True
+    return False
 
 
 def _slot_of(expr):
@@ -162,7 +219,7 @@ def _slot_of(expr):
     return None
 
 
-def _disjoint(a, b):
+def _disjoint(a, b, defs=None):
     """
     Provably different quadwords.
 
@@ -171,7 +228,7 @@ def _disjoint(a, b):
     is.  Different or unknown bases are not provable and must be assumed to
     alias.
     """
-    if a[0] != b[0]:
+    if not _same_base(a[0], b[0], defs):
         return False
     d = (a[1] - b[1]) & 0xFFFFFFFF
     if d >= 0x80000000:
@@ -213,7 +270,7 @@ def _fresh_reg(func):
     return n
 
 
-def _offset_addr(func, insn, base_val, slot):
+def _offset_addr(func, insn, base_val, slot, defs=None):
     """
     Materialise ``base + slot`` just before ``insn`` and return a Var for it.
 
@@ -221,10 +278,11 @@ def _offset_addr(func, insn, base_val, slot):
     hardware reads ``align(addr) + slot``, so that is the address to show --
     and it is exact, not an assumption about the base's alignment.
     """
+    base = unaligned_of(base_val, defs) if defs else base_val
     if slot == 0:
-        return _clone(base_val)
+        return _clone(base)
     r = _fresh_reg(func)
-    add = Insn(Op.ADD, Var(r, 1), [_clone(base_val),
+    add = Insn(Op.ADD, Var(r, 1), [_clone(base),
                                    Const(pack([slot] * 4, EW.W))],
                ew=EW.W, ea=insn.ea, scalar=True,
                comment="byte %d within the quadword" % slot)
@@ -251,7 +309,7 @@ def _effective_addr(addr, sa, ca, defs):
 
 
 # Ops that define a new memory state, with the previous state in srcs[0].
-_MEM_DEFS = frozenset((Op.STOREQ, Op.STORE, Op.SYNC, Op.CALL, Op.ICALL))
+_MEM_DEFS = frozenset((Op.STOREQ, Op.STORE, Op.SYNC, Op.CALL, Op.ICALL, Op.TCALL))
 
 
 def _chain_hazards(store_mem, load_mem, defs, target, limit=64):
@@ -273,7 +331,7 @@ def _chain_hazards(store_mem, load_mem, defs, target, limit=64):
         if d is None or d.op == Op.PHI or d.op not in _MEM_DEFS:
             return None
         if d.op in (Op.STOREQ, Op.STORE):
-            if not _disjoint(addr_expr(d.srcs[1], defs), target):
+            if not _disjoint(addr_expr(d.srcs[1], defs), target, defs):
                 hazards.append(d)
         else:
             hazards.append(d)                # a call may write anything
@@ -286,57 +344,89 @@ def _chain_hazards(store_mem, load_mem, defs, target, limit=64):
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_shufb_chain(val, defs, limit=32):
+    """
+    Unwrap a chain of shufb operations:
+    shufb(val_N, ... shufb(val_1, base, ctl_1) ..., ctl_N)
+    Returns (chain, base) where chain is [(shuf_insn, val_i, ctl_insn), ...]
+    ordered from first applied to last applied (shuf_1 to shuf_N).
+    """
+    chain = []
+    cur = val
+    for _ in range(limit):
+        if not cur.is_var:
+            break
+        shuf = defs.get(cur.key())
+        if shuf is None or shuf.op != Op.SHUFB or len(shuf.srcs) != 3:
+            break
+        a, b, c = shuf.srcs
+        if not c.is_var:
+            break
+        ctl = defs.get(c.key())
+        if ctl is None or ctl.op != Op.GENCTL:
+            break
+        chain.append((shuf, a, ctl))
+        cur = b
+    if not chain:
+        return None, None
+    chain.reverse()
+    return chain, cur
+
+
 def _match_store(insn, defs, strict=False):
     """
     ``storeq(mem, addr, shufb(val, loadq(mem', addr), genctl(addr)))``
-    -> ``(genctl insn, value operand, effective address, hazards)``.
+    -> ``(items, ld, hazards, shufs)``
+    where items is ``[(ctl, val_operand, effective_addr, slot), ...]``.
     """
     mem, addr, val = insn.srcs
     if not val.is_var:
         return None
-    shuf = defs.get(val.key())
-    if shuf is None or shuf.op != Op.SHUFB:
+    chain, base = _unwrap_shufb_chain(val, defs)
+    if not chain or base is None:
         return None
-    a, b, c = shuf.srcs
-    if not (b.is_var and c.is_var):
-        return None
-    ctl = defs.get(c.key())
-    if ctl is None or ctl.op != Op.GENCTL:
-        return None
-    ld = defs.get(b.key())
-    if ld is None or ld.op != Op.LOADQ:
+    ld = defs.get(base.key()) if base.is_var else None
+    is_loadq = (ld is not None and ld.op == Op.LOADQ)
+    is_const0 = (base.is_const and base.val == 0) or (ld is not None and ld.op == Op.CONST and ld.srcs[0].val == 0)
+    if not (is_loadq or is_const0):
         return None
 
     sa = addr_expr(addr, defs)
-    la = addr_expr(ld.srcs[1], defs)
-    ca = addr_expr(ctl.srcs[0], defs)
-    if not (sa[2] and la[2]):
-        return None                      # both must be the aligned form
-    if not _same_target(sa, la):
-        return None
-
-    slot = None
-    if _same_slot(sa, ca):
-        eff = _effective_addr(addr, sa, ca, defs)
-    else:
-        # The mask may be generated from a different, known-aligned register.
-        # When its slot is provable the scalar lands at that byte of the
-        # quadword the store targets, whatever base the mask came from.
-        slot = _slot_of(ca)
-        if slot is None:
+    if is_loadq:
+        la = addr_expr(ld.srcs[1], defs)
+        if not (sa[2] and la[2]):
+            return None                      # both must be the aligned form
+        if not _same_target(sa, la, defs):
             return None
-        eff = None                      # built by the caller, needs the block
+    else:
+        if not sa[2]:
+            return None
+
+    items = []
+    shufs = []
+    for shuf, a, ctl in chain:
+        shufs.append(shuf)
+        ca = addr_expr(ctl.srcs[0], defs)
+        slot = None
+        if _same_slot(sa, ca, defs):
+            eff = _effective_addr(addr, sa, ca, defs)
+        else:
+            slot = _slot_of(ca)
+            if slot is None:
+                return None
+            eff = None
+        items.append((ctl, a, eff, slot))
 
     # The read-modify-write reads one memory state and writes back onto
     # another.  If anything wrote the same quadword in between, folding the
     # merge away changes what survives -- the machine code would be discarding
     # that write, which a compiler only emits when it knows they cannot alias.
-    hazards = _chain_hazards(mem, ld.srcs[0], defs, sa)
+    hazards = _chain_hazards(mem, ld.srcs[0], defs, sa) if is_loadq else []
     if hazards is None:
         return None
     if hazards and strict:
         return None
-    return ctl, a, eff, hazards, slot
+    return items, (ld if is_loadq else None), hazards, shufs
 
 
 def _match_load(insn, defs):
@@ -357,7 +447,7 @@ def _match_load(insn, defs):
 
     # Same relaxation as the store side: the rotate count only contributes
     # its low 4 bits, so it may come from a congruent address.
-    if _same_slot(la, ca):
+    if _same_slot(la, ca, defs):
         return ld, _effective_addr(ld.srcs[1], la, ca, defs), None
 
     # Absolute form: `lqa` at an aligned literal plus `rotqbyi` by the byte
@@ -366,6 +456,15 @@ def _match_load(insn, defs):
         return (ld,
                 Const((((la[1] & ~0xF) | (ca[1] & 0xF)) & 0xFFFFFFFF) << 96),
                 None)
+
+    # If both expressions share a base register and the offset difference falls
+    # within the loaded quadword, cnt is the exact byte address of the scalar.
+    if _same_base(la[0], ca[0], defs):
+        d = (ca[1] - la[1]) & 0xFFFFFFFF
+        if d < 16 or d >= 0xFFFFFFF0:
+            if ca[0] is None:
+                return ld, Const((ca[1] & 0xFFFFFFFF) << 96), None
+            return ld, _clone(unaligned_of(cnt, defs)), None
 
     # The rotate count comes from somewhere else whose slot is provable (the
     # stack pointer, or a literal).  The rotate brings that byte of the loaded
@@ -404,27 +503,86 @@ def recover_stores(func, strict=False):
     if roots is None:
         roots = func.store_idiom_roots = set()
 
+    max_mem = 0
+    max_ver = {}
+    for i in func.insns():
+        for v in [i.dst] + i.srcs:
+            if v is not None and v.is_var:
+                if v.reg == 128:
+                    max_mem = max(max_mem, v.ver)
+                max_ver[v.reg] = max(max_ver.get(v.reg, 0), v.ver)
+
     n = assumed = 0
-    for insn, m in matches:
-        ctl, val, addr, hazards, slot = m
-        shuf = defs.get(insn.srcs[2].key()) if insn.srcs[2].is_var else None
-        if shuf is not None:
+    for insn, (items, ld, hazards, shufs) in matches:
+        orig_val = insn.srcs[2]
+        base_addr = _clone(insn.srcs[1])
+        other_users = [u for u in func.insns() if u is not insn and any(s.is_var and s.key() == orig_val.key() for s in u.srcs)]
+
+        if ld:
+            if ld.dst:
+                roots.add(ld.dst.key())
+            for s in ld.srcs:
+                if s.is_var:
+                    roots.add(s.key())
+        for shuf in shufs:
+            if shuf.dst:
+                roots.add(shuf.dst.key())
             for s in shuf.srcs:
                 if s.is_var:
                     roots.add(s.key())
-        if addr is None:
-            addr = _offset_addr(func, insn, insn.srcs[1], slot)
-        insn.op = Op.STORE
-        insn.ew = ctl.ew
-        insn.srcs = [insn.srcs[0], addr, _clone(val)]
-        if hazards:
-            assumed += 1
-            where = ", ".join("0x%X" % (h.ea or 0) for h in hazards[:3])
-            insn.comment = ("was cwd/lqd/shufb/stqd; assumes no alias with "
-                            "the write at %s" % where)
-        else:
-            insn.comment = "was cwd/lqd/shufb/stqd"
-        n += 1
+        for ctl, a, eff, slot in items:
+            if ctl.dst:
+                roots.add(ctl.dst.key())
+            for s in ctl.srcs:
+                if s.is_var:
+                    roots.add(s.key())
+
+        cur_mem = insn.srcs[0]
+        blk = insn.block
+        for i, (ctl, val, eff, slot) in enumerate(items):
+            if eff is None:
+                eff = _offset_addr(func, insn, base_addr, slot, defs)
+            is_last = (i == len(items) - 1)
+            dst_mem = insn.dst if is_last else Var(128, max_mem + 1)
+            if not is_last:
+                max_mem += 1
+                new_st = Insn(Op.STORE, dst_mem, [_clone(cur_mem), eff, _clone(val)],
+                              ew=ctl.ew, ea=insn.ea)
+                new_st.block = blk
+                if hazards:
+                    assumed += 1
+                    where = ", ".join("0x%X" % (h.ea or 0) for h in hazards[:3])
+                    new_st.comment = ("was cwd/lqd/shufb/stqd; assumes no alias with "
+                                      "the write at %s" % where)
+                else:
+                    new_st.comment = "was cwd/lqd/shufb/stqd"
+                blk.insns.insert(blk.insns.index(insn), new_st)
+            else:
+                insn.op = Op.STORE
+                insn.ew = ctl.ew
+                insn.srcs = [_clone(cur_mem), eff, _clone(val)]
+                if hazards:
+                    assumed += 1
+                    where = ", ".join("0x%X" % (h.ea or 0) for h in hazards[:3])
+                    insn.comment = ("was cwd/lqd/shufb/stqd; assumes no alias with "
+                                    "the write at %s" % where)
+                else:
+                    insn.comment = "was cwd/lqd/shufb/stqd"
+            cur_mem = dst_mem
+            n += 1
+
+        if other_users:
+            nv = max_ver.get(orig_val.reg, 0) + 1
+            max_ver[orig_val.reg] = nv
+            reload_var = Var(orig_val.reg, nv)
+            reload_insn = Insn(Op.LOADQ, reload_var, [cur_mem, base_addr], ea=insn.ea)
+            reload_insn.block = blk
+            st_idx = blk.insns.index(insn)
+            blk.insns.insert(st_idx + 1, reload_insn)
+            for u in other_users:
+                for s_idx, s in enumerate(u.srcs):
+                    if s.is_var and s.key() == orig_val.key():
+                        u.srcs[s_idx] = reload_var
     return n, assumed
 
 
@@ -500,6 +658,48 @@ def mark_scalars(func, demand):
     return n
 
 
+def propagate_scalar_slots(func, demand):
+    """
+    For a shufb(val, old, genctl) where genctl inserts into slot k >= 4, word 0 is old.
+    If slot == 0 and ew == EW.W, word 0 is val.
+    Consumers that only read word 0 (preferred slot) can read that source directly,
+    freeing the shufb and genctl to be eliminated as dead debris.
+    """
+    defs = _defmap(func)
+    n = 0
+    for insn in func.insns():
+        if insn.op != Op.SHUFB or len(insn.srcs) != 3 or insn.dst is None:
+            continue
+        val, old, ctl = insn.srcs
+        if not (ctl.is_var and ctl.key() in defs):
+            continue
+        ctl_def = defs[ctl.key()]
+        if ctl_def.op != Op.GENCTL:
+            continue
+        slot = _slot_of(addr_expr(ctl_def.srcs[0], defs))
+        if slot is None:
+            continue
+        target = None
+        if slot >= 4 and old.is_var:
+            target = old
+        elif slot == 0 and ctl_def.ew == EW.W:
+            target = val
+        if target is None:
+            continue
+
+        for user in func.insns():
+            if user is insn:
+                continue
+            for idx, u in enumerate(user.srcs):
+                if u.is_var and u.key() == insn.dst.key():
+                    if (user.op in INFIX and user.ew == EW.W) or \
+                       (user.op in (Op.ADD, Op.SUB) and user.ew == EW.W) or \
+                       lanes.is_scalar(demand.get(insn.dst.key(), ALL)):
+                        user.srcs[idx] = _clone(target)
+                        n += 1
+    return n
+
+
 def _callee():
     """
     The cross-procedural demand hook, or None outside a database.
@@ -540,6 +740,9 @@ def scalarize(func, strict=False):
 
     demand = lanes.compute_demand(func, callee=_callee())
     stats["aligned_loads"] = recover_aligned_loads(func, demand)
+
+    demand = lanes.compute_demand(func, callee=_callee())
+    propagate_scalar_slots(func, demand)
 
     demand = lanes.compute_demand(func, callee=_callee())
     stats["scalars"] = mark_scalars(func, demand)

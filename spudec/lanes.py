@@ -123,7 +123,7 @@ def _abi_contrib(insn, n, callee):
     from . import regs
     out = []
     masks = None
-    if callee is not None and insn.op == Op.CALL and insn.aux is not None:
+    if callee is not None and insn.op in (Op.CALL, Op.TCALL) and insn.aux is not None:
         masks = callee(insn.aux)
     real = ABI_OPS.get(insn.op, 0)
     for i, src in enumerate(insn.srcs):
@@ -309,4 +309,8 @@ def narrowest(mask, table=LEAD):
     for ew in (EW.B, EW.H, EW.W, EW.D):
         if fits(mask, ew, table):
             return ew
+    if table is LEAD:
+        for ew in (EW.B, EW.H, EW.W, EW.D):
+            if fits(mask, ew, SLOT_LOW):
+                return ew
     return None

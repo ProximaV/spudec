@@ -223,7 +223,6 @@ class Lifter(object):
         # tell these apart -- the list has to be explicit.
         self.rr_acc = {
             "addx":    (Op.ADDX, EW.W),     # rt = ra + rb + (rt & 1)
-            "sfx":     (Op.SUBX, EW.W),     # rt = rb + ~ra + (rt & 1)
             "cgx":     (Op.CGX, EW.W),
             "bgx":     (Op.BGX, EW.W),
             "mpyhha":  (Op.MPYHHA, EW.W),
@@ -565,6 +564,12 @@ class Lifter(object):
         # sf rt, ra, rb  =>  rt = rb - ra
         self.emit(Op.SUB, insn.Op1.reg,
                   [self.r(insn.Op3), self.r(insn.Op2)], EW.W)
+
+    def _i_sfx(self, insn, name):
+        # sfx rt, ra, rb  =>  rt = rb - ra + (rt & 1) - 1
+        self.emit(Op.SUBX, insn.Op1.reg,
+                  [self.r(insn.Op3), self.r(insn.Op2), Var(insn.Op1.reg)],
+                  EW.W)
 
     def _i_sfh(self, insn, name):
         self.emit(Op.SUB, insn.Op1.reg,

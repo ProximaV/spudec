@@ -213,6 +213,11 @@ class SpuDecPlugin(ida_idaapi.plugin_t):
         _run_one()
 
     def term(self):
+        try:
+            from spudec import view
+            view.cleanup()
+        except Exception:
+            pass
         for ctx in _hotkeys:
             try:
                 ida_kernwin.del_hotkey(ctx)

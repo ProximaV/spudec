@@ -8,7 +8,36 @@ procs/spu.py -> lifter -> CFG -> SSA -> opt -> scalarise -> opt
              -> structure -> pseudocode
 ```
 
-Place the plugin and the folder under the ida instalation directory / plugins folder
+Place the plugin (`spudec_plugin.py`) and the `spudec/` package folder under the IDA installation directory `plugins/` folder (or `%APPDATA%\Hex-Rays\IDA Pro\plugins\`).
+
+## Interactive Decompiler View
+
+When decompiling in IDA Pro, `spudec` opens a dedicated dockable decompiler view with full interactive analysis features:
+
+| Hotkey / Action | Description |
+| --- | --- |
+| `Ctrl-Shift-S` | Decompile the function under the cursor |
+| `Ctrl-F5` | Batch decompile all functions in the database |
+| `F5` | Refresh / re-decompile the active function |
+| `N` | Rename variable, callee, symbol, or stack frame member |
+| `Y` | Set variable type or function prototype |
+| `Tab` | Toggle bidirectional disassembly synchronization |
+| `Enter` / `Space` / Double-click | Click-through navigation to callee or jump to disassembly EA |
+| `I` | Toggle between high-level C pseudocode and low-level SSA IR |
+| `Esc` | Close decompiler viewer and clear instruction highlights |
+
+### Key Features
+
+* **Bidirectional Disassembly Synchronization**: Cursor movement in the decompiler view synchronizes and highlights the corresponding instruction(s) in IDA's disassembly window, and clicking anywhere in disassembly jumps and highlights the matching pseudocode line in real time.
+* **Dense Instruction Coverage**: Every instruction across all basic blocks, jump sequences, and out-of-order function tail chunks maps to a valid decompiled line.
+* **Theme-Aware Syntax Highlighting**: Auto-detects IDA Pro dark and light palettes for syntax and active line highlighting.
+* **Netnode-Backed Persistence**: Variable renames, type overrides, prototype overrides, and view preferences are persistently stored in the IDA database via a dedicated netnode (`$ spudec`).
+
+## Calling Convention & Frame Recovery
+
+The SPU ABI defines arguments in `$r3`–`$r74`, return values in `$r3`, stack pointer in `$r1`, and the link/return address register in `$r0`. Registers `$r80`–`$r127` are callee-saved:
+* **Prototype Overrides & Parsing**: Functions accept custom C function prototypes (`int foo(int *buf, unsigned int size)`), mapping arguments to `$r3`+ registers automatically.
+* **Stack Frame Recovery**: Resolves stack frame references relative to `$r1`, naming slots and supporting member renaming via IDA 9.0+ UDT/frame interfaces.
 
 ## C++ names
 
@@ -63,7 +92,14 @@ arithmetic scales and the SPU's does not -- `sp - 0x13B0` on an
 
 ## Tests
 
-    python tests/test_pipeline.py
+```
+python tests/test_pipeline.py
+python tests/test_recover.py
+python tests/test_highlight.py
+```
 
-Builds IR by hand, so it needs no IDA: covers the phi-argument regression and
-the string rendering.
+* `test_pipeline.py`: Audits the IR pipeline, phi handling, string rendering, inlining depth cap, and frame slot representations.
+* `test_recover.py`: Tests netnode persistence, calling convention prototype parsing, variable rename/type application, and `CodeLines` address mapping.
+* `test_highlight.py`: Validates syntax tokenization, keyword coloring, and address prefix formatting.
+
+All test suites run standalone without requiring an active IDA GUI.

@@ -30,6 +30,8 @@ C_TYPES = frozenset((
     "float", "double", "const", "struct", "union", "enum",
     # what this decompiler emits
     "qword", "qword_unaligned", "u8", "u16", "u32", "u64",
+    "s8", "s16", "s32", "s64", "size_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "int8_t", "int16_t", "int32_t", "int64_t", "uintptr_t", "intptr_t",
 ))
 
 # Tokens, in priority order.  `placeholder` deliberately requires a letter
@@ -102,7 +104,7 @@ def _ident_color(text, line, after):
     if base in C_TYPES or base.startswith("vec_"):
         return ida_lines.SCOLOR_TYPE
     if base.startswith("loc_") or base.startswith("def_") \
-            or base.startswith("jpt_"):
+            or base.startswith("jpt_") or base.startswith("sub_"):
         return ida_lines.SCOLOR_CREFTAIL
     # An identifier followed by '(' is being called.  This also picks up the
     # vector intrinsics (`shufb(`, `add.w(`), which is what we want: they are

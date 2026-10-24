@@ -160,10 +160,11 @@ def analyse(func):
             a, b = i.srcs
             k = b.word0 if b.is_const else (a.word0 if a.is_const else None)
             other = a if b.is_const else b
-            if k is not None and other.is_var and other.key() == sp_in:
+            if k is not None and other.is_var and other.reg == regs.SP:
                 delta = signed_offset(k)
-                if delta < 0:
+                if delta < 0 and other.key() == sp_in:
                     fr.size = -delta
+                fr.hidden.add(id(i))
 
     for i in func.insns():
         if i.op != Op.STOREQ or len(i.srcs) < 3:
