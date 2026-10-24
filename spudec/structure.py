@@ -367,7 +367,7 @@ def _stmts(b, stop, ctx, depth=0, skip_control=None):
             # than a label, so duplicate instead of branching.
             if _duplicable(cur):
                 last = cur.insns[-1]
-                out.append(Tail(last) if last.op == Op.JMP
+                out.append(Tail(last) if last.op in (Op.JMP, Op.IJMP, Op.TCALL)
                            else Return(last))
                 return out
             if ctx.may_duplicate(cur):
@@ -429,9 +429,9 @@ def _stmts(b, stop, ctx, depth=0, skip_control=None):
         elif term.op in (Op.RET, Op.STOP):
             out.append(Return(term))
             return out
-        elif term.op == Op.IJMP:
+        elif term.op in (Op.IJMP, Op.TCALL):
             out.append(Tail(term))
-            if not cur.succs:
+            if not cur.succs or term.op == Op.TCALL:
                 return out              # unresolved indirect jump / tail call
             # A resolved switch: IDA's jump table gave every case as a real
             # successor (cfg wired them).  Emit each so it is reached and

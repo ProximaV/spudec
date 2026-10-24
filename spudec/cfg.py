@@ -12,9 +12,9 @@ The SPU has no delay slots, so a block ends cleanly at its branch.
 import ida_funcs
 import ida_gdl
 
-from .ir import Op, Insn, Function
+from .ir import Op, Insn, Function, Var
 from .lifter import Lifter, lift_range
-from . import abi, data
+from . import abi, data, regs
 
 
 def build(func_ea, drop_hints=True):
@@ -70,11 +70,11 @@ def _add_fallthrough_jumps(func, lifter):
         elif not b.succs:
             if b.start_ea == b.end_ea:
                 # IDA's flow chart emits a zero-length stub for a branch
-                # target *outside* the function.  Calling that a return is
-                # wrong and actively misleading -- control goes to that
-                # address, it does not come back to the caller.
-                b.add(Insn(Op.JMP, None, [], ea=b.start_ea,
-                           aux=b.start_ea, comment="outside this function"))
+                # target *outside* the function. This is a direct tail call.
+                # It passes arguments (r3..r10) and memory/channel, then returns.
+                tail_abi = [Var(regs.R_MEM), Var(regs.R_CH)] + [Var(r) for r in lifter.abi_args]
+                b.add(Insn(Op.TCALL, None, tail_abi, ea=b.start_ea,
+                           aux=b.start_ea, comment="tail call outside this function"))
             else:
                 # A real tail block with no outgoing edge: an unrecognised
                 # tail call or the end of a noreturn path.

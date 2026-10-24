@@ -187,6 +187,7 @@ class Op(IntEnum):
     # falls through when the test fails, and IDA gives no edge for the taken
     # side because the target is computed.
     CIJMP = 146
+    TCALL = 147      # direct tail call to another function; aux = target ea
 
     # -- side-effecting / system ------------------------------------------
     RDCH = 150       # dst = rdch(chain, ch)
@@ -212,14 +213,15 @@ class Op(IntEnum):
 # made a block-final call get sliced off with the terminator and vanish from
 # the rendered statements entirely.
 _TERMINATORS = frozenset(
-    (Op.JMP, Op.CJMP, Op.IJMP, Op.RET, Op.STOP)
+    (Op.JMP, Op.CJMP, Op.IJMP, Op.RET, Op.STOP, Op.TCALL)
 )
 
 # Ops that must never be removed by dead-code elimination even when their
 # result is unused.
 _SIDE_EFFECTS = frozenset(
     (Op.STOREQ, Op.STORE, Op.WRCH, Op.RDCH, Op.RCHCNT, Op.MTSPR, Op.MFSPR,
-     Op.STOP, Op.SYNC, Op.HALT, Op.INTRINSIC, Op.CALL, Op.ICALL, Op.CIJMP)
+     Op.STOP, Op.SYNC, Op.HALT, Op.INTRINSIC, Op.CALL, Op.ICALL, Op.CIJMP,
+     Op.TCALL)
 )
 
 # Memory reads: removable when their result is unused (local store has no
@@ -257,7 +259,7 @@ OP_NAME = {
     Op.LOADQ: "loadq", Op.STOREQ: "storeq",
     Op.LOAD: "load", Op.STORE: "store", Op.LOADU: "loadu",
     Op.JMP: "jmp", Op.CJMP: "cjmp", Op.CALL: "call", Op.ICALL: "icall",
-    Op.IJMP: "ijmp", Op.RET: "ret", Op.CIJMP: "cijmp",
+    Op.IJMP: "ijmp", Op.RET: "ret", Op.CIJMP: "cijmp", Op.TCALL: "tcall",
     Op.RDCH: "rdch", Op.WRCH: "wrch", Op.RCHCNT: "rchcnt",
     Op.MFSPR: "mfspr", Op.MTSPR: "mtspr",
     Op.STOP: "stop", Op.SYNC: "sync", Op.NOP: "nop", Op.HALT: "halt",
@@ -494,12 +496,12 @@ INFIX = {
 
 # Ops that carry the ABI register set, mapped to how many leading operands are
 # the "real" ones (an indirect target) rather than ABI filler.
-ABI_OPS = {Op.CALL: 0, Op.ICALL: 1, Op.IJMP: 1, Op.RET: 0, Op.STOP: 0}
+ABI_OPS = {Op.CALL: 0, Op.ICALL: 1, Op.IJMP: 1, Op.RET: 0, Op.STOP: 0, Op.TCALL: 0}
 _ABI_OPS = ABI_OPS
 
 
 def _fmt_aux(op, aux):
-    if op in (Op.JMP, Op.CALL):
+    if op in (Op.JMP, Op.CALL, Op.TCALL):
         return "0x%X" % aux
     if op == Op.CJMP:
         return "0x%X if %s" % (aux[0], aux[1])

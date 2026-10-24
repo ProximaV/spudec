@@ -232,7 +232,7 @@ def _inlinable(func, call_args=None, debris=None):
             continue
         if insn.op == Op.RET:
             real_srcs = [s for s in insn.srcs if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0]
-        elif insn.op in (Op.CALL, Op.ICALL):
+        elif insn.op in (Op.CALL, Op.ICALL, Op.TCALL):
             n_real = ABI_OPS.get(insn.op, 0)
             real_srcs = [s for s in insn.srcs[:n_real] if s.is_var] + list(call_args.get(id(insn), []))
         else:
@@ -263,7 +263,7 @@ def _inlinable(func, call_args=None, debris=None):
         if site.op == Op.PHI:
             continue
         if site.op in ABI_OPS and not (is_arg and
-                                       site.op in (Op.CALL, Op.ICALL)):
+                                       site.op in (Op.CALL, Op.ICALL, Op.TCALL)):
             continue
         if site.block is not insn.block:
             continue
@@ -378,7 +378,7 @@ class CGen(object):
         # Which operands of each call are really its arguments.
         self.call_args = {}
         for insn in func.insns():
-            if insn.op in (Op.CALL, Op.ICALL):
+            if insn.op in (Op.CALL, Op.ICALL, Op.TCALL):
                 args = self._compute_call_args(insn, arity_of, defs_map)
                 if args:
                     self.call_args[id(insn)] = args
@@ -434,7 +434,7 @@ class CGen(object):
             pnames[(r, 0)] = eff_nm
         self.namer = Namer(func, pnames, self.call_args)
         self.call_at = {i.ea: i for i in func.insns()
-                        if i.op in (Op.CALL, Op.ICALL)}
+                        if i.op in (Op.CALL, Op.ICALL, Op.TCALL)}
         self.defs = defs_map
         self.debris = self._compute_debris()
         # Argument setup may fold into the call now that the call shows its
@@ -506,7 +506,7 @@ class CGen(object):
             return []
 
         callee_var = False
-        if insn.op == Op.CALL and insn.aux is not None:
+        if insn.op in (Op.CALL, Op.TCALL) and insn.aux is not None:
             try:
                 from . import is_variadic
                 callee_var = is_variadic(insn.aux)
@@ -514,7 +514,7 @@ class CGen(object):
                 pass
 
         n = None
-        if insn.op == Op.CALL and insn.aux is not None and arity_of is not None:
+        if insn.op in (Op.CALL, Op.TCALL) and insn.aux is not None and arity_of is not None:
             n = arity_of(insn.aux)
 
         if not callee_var and n is not None and 0 < n <= len(by_reg):
@@ -710,8 +710,8 @@ class CGen(object):
                                          for s in insn.srcs)
         if op in (Op.LOAD, Op.LOADQ, Op.LOADU):
             return self._deref(insn, depth)
-        if op in (Op.CALL, Op.ICALL):
-            if op == Op.CALL:
+        if op in (Op.CALL, Op.ICALL, Op.TCALL):
+            if op in (Op.CALL, Op.TCALL):
                 raw_tgt = self.name_of(insn.aux)
                 tgt = self.user_renames.get(raw_tgt, raw_tgt)
             else:
@@ -1620,7 +1620,7 @@ class CGen(object):
             op = insn.op
             if op in ABI_OPS:
                 keep = list(insn.srcs[:ABI_OPS[op]])      # indirect target
-                if op == Op.CALL:
+                if op in (Op.CALL, Op.TCALL):
                     n = (self.arity_of(insn.aux)
                          if self.arity_of is not None and insn.aux is not None
                          else None)
@@ -1926,6 +1926,13 @@ class CGen(object):
                     kind = ("jump table" if blk is not None
                             and len(blk.succs) > 1 else "indirect / tail call")
                     txt = "%sgoto *%s;   // %s" % (pad, self.operand(st.insn.srcs[0], 0, True), kind)
+                    self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
+                elif st.insn.op == Op.TCALL:
+                    call_str = self.rhs(st.insn)
+                    if self.ret_type != "void":
+                        txt = "%sreturn %s;" % (pad, call_str)
+                    else:
+                        txt = "%s%s;" % (pad, call_str)
                     self._add_line(out, txt, primary_ea=ea, inlined_eas=self._current_inlined_eas)
                 elif st.insn.op == Op.JMP:
                     target_name = self.name_of(st.insn.aux) if self.name_of else None
@@ -2289,16 +2296,16 @@ def _params(func, arity_of=None):
         if insn.op == Op.PHI:
             continue
         if insn.op in ABI_OPS:
-            if arity_of is None or insn.op not in (Op.CALL, Op.ICALL):
+            if arity_of is None or insn.op not in (Op.CALL, Op.ICALL, Op.TCALL):
                 continue
-            if insn.op == Op.CALL and insn.aux is not None:
+            if insn.op in (Op.CALL, Op.TCALL) and insn.aux is not None:
                 try:
                     from . import is_variadic
                     if is_variadic(insn.aux):
                         continue
                 except Exception:
                     pass
-            n = arity_of(insn.aux) if insn.op == Op.CALL else None
+            n = arity_of(insn.aux) if insn.op in (Op.CALL, Op.TCALL) else None
             if not n:
                 continue
             args = call_arguments(insn, n) or []

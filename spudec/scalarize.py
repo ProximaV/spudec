@@ -309,7 +309,7 @@ def _effective_addr(addr, sa, ca, defs):
 
 
 # Ops that define a new memory state, with the previous state in srcs[0].
-_MEM_DEFS = frozenset((Op.STOREQ, Op.STORE, Op.SYNC, Op.CALL, Op.ICALL))
+_MEM_DEFS = frozenset((Op.STOREQ, Op.STORE, Op.SYNC, Op.CALL, Op.ICALL, Op.TCALL))
 
 
 def _chain_hazards(store_mem, load_mem, defs, target, limit=64):
@@ -504,13 +504,20 @@ def recover_stores(func, strict=False):
         roots = func.store_idiom_roots = set()
 
     max_mem = 0
+    max_ver = {}
     for i in func.insns():
         for v in [i.dst] + i.srcs:
-            if v is not None and v.is_var and v.reg == 128:
-                max_mem = max(max_mem, v.ver)
+            if v is not None and v.is_var:
+                if v.reg == 128:
+                    max_mem = max(max_mem, v.ver)
+                max_ver[v.reg] = max(max_ver.get(v.reg, 0), v.ver)
 
     n = assumed = 0
     for insn, (items, ld, hazards, shufs) in matches:
+        orig_val = insn.srcs[2]
+        base_addr = _clone(insn.srcs[1])
+        other_users = [u for u in func.insns() if u is not insn and any(s.is_var and s.key() == orig_val.key() for s in u.srcs)]
+
         if ld:
             if ld.dst:
                 roots.add(ld.dst.key())
@@ -534,7 +541,7 @@ def recover_stores(func, strict=False):
         blk = insn.block
         for i, (ctl, val, eff, slot) in enumerate(items):
             if eff is None:
-                eff = _offset_addr(func, insn, insn.srcs[1], slot, defs)
+                eff = _offset_addr(func, insn, base_addr, slot, defs)
             is_last = (i == len(items) - 1)
             dst_mem = insn.dst if is_last else Var(128, max_mem + 1)
             if not is_last:
@@ -563,6 +570,19 @@ def recover_stores(func, strict=False):
                     insn.comment = "was cwd/lqd/shufb/stqd"
             cur_mem = dst_mem
             n += 1
+
+        if other_users:
+            nv = max_ver.get(orig_val.reg, 0) + 1
+            max_ver[orig_val.reg] = nv
+            reload_var = Var(orig_val.reg, nv)
+            reload_insn = Insn(Op.LOADQ, reload_var, [cur_mem, base_addr], ea=insn.ea)
+            reload_insn.block = blk
+            st_idx = blk.insns.index(insn)
+            blk.insns.insert(st_idx + 1, reload_insn)
+            for u in other_users:
+                for s_idx, s in enumerate(u.srcs):
+                    if s.is_var and s.key() == orig_val.key():
+                        u.srcs[s_idx] = reload_var
     return n, assumed
 
 
