@@ -191,7 +191,7 @@ class Namer(object):
 # ---------------------------------------------------------------------------
 
 
-def _inlinable(func, call_args=None):
+def _inlinable(func, call_args=None, debris=None):
     """
     Keys of definitions that should print at their use site instead.
 
@@ -217,6 +217,7 @@ def _inlinable(func, call_args=None):
     setup line is the only evidence the value was ever produced.
     """
     call_args = call_args or {}
+    debris = debris or set()
     rendered = {}                   # key -> the calls that will print it
     for cid, args in call_args.items():
         for a in args:
@@ -227,6 +228,8 @@ def _inlinable(func, call_args=None):
         d = insn.defines()
         if d is not None:
             defs[d.key()] = insn
+        if d is not None and d.key() in debris:
+            continue
         for u in insn.uses():
             k = u.key()
             use_count[k] = use_count.get(k, 0) + 1
@@ -316,6 +319,24 @@ def _chain_positions(ok, defs, use_site):
 # ---------------------------------------------------------------------------
 
 
+def _is_active_arg(v, defs, params, visited=None):
+    if v.ver == 0:
+        return v.reg in params
+    if defs is None:
+        return False
+    d = defs.get(v.key())
+    if d is None or d.op == Op.UNDEF:
+        return False
+    if d.op == Op.PHI:
+        if visited is None:
+            visited = set()
+        if v.key() in visited:
+            return False
+        visited.add(v.key())
+        return any(s.is_var and _is_active_arg(s, defs, params, visited) for s in d.srcs)
+    return True
+
+
 class CGen(object):
 
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
@@ -338,11 +359,13 @@ class CGen(object):
         # header comment so the mapping back to the disassembly is not lost.
         self.params = _params(func, arity_of)
 
+        defs_map = {i.defines().key(): i for i in func.insns() if i.defines() is not None}
+
         # Which operands of each call are really its arguments.
         self.call_args = {}
         for insn in func.insns():
             if insn.op in (Op.CALL, Op.ICALL):
-                args = self._compute_call_args(insn, arity_of)
+                args = self._compute_call_args(insn, arity_of, defs_map)
                 if args:
                     self.call_args[id(insn)] = args
 
@@ -394,11 +417,15 @@ class CGen(object):
             self.param_name[r] = eff_nm
             pnames[(r, 0)] = eff_nm
         self.namer = Namer(func, pnames, self.call_args)
+        self.call_at = {i.ea: i for i in func.insns()
+                        if i.op in (Op.CALL, Op.ICALL)}
+        self.defs = defs_map
+        self.debris = self._compute_debris()
         # Argument setup may fold into the call now that the call shows its
         # arguments -- but only for operands that are actually rendered.  A
         # register set before a call the callee never reads must stay a
         # visible statement, or the value would vanish from the listing.
-        self.inlinable, self.defs = _inlinable(func, self.call_args)
+        self.inlinable, self.defs = _inlinable(func, self.call_args, self.debris)
         self.name_of = name_of or (lambda ea: "sub_%X" % ea)
         # Names the rendered body actually mentions; `declarations` declares
         # exactly these, so the two can never disagree.
@@ -426,13 +453,6 @@ class CGen(object):
         # of them could alias a named slot, so the header says how many
         # there were rather than the pass pretending there were none.
         self.stack_unresolved = 0
-        self.call_at = {i.ea: i for i in func.insns()
-                        if i.op in (Op.CALL, Op.ICALL)}
-        # Definitions kept alive only by a known-arity call's conservative ABI
-        # operand list, read by nothing real -- dead idiom debris (see
-        # `_compute_debris`).  Computed before `visible`, which asks
-        # `_suppressed`, which consults it.
-        self.debris = self._compute_debris()
         # Names some visible definition really assigns.  A printed phi can
         # otherwise name a value whose every definition is suppressed -- a
         # colour made only of other phis and muted clobbers -- and the listing
@@ -461,7 +481,7 @@ class CGen(object):
             func.types = self.types
             func.type_stats = stats
 
-    def _compute_call_args(self, insn, arity_of):
+    def _compute_call_args(self, insn, arity_of, defs=None):
         by_reg = {}
         for s in insn.srcs:
             if s.is_var and regs.ARG_FIRST <= s.reg <= regs.ARG_LAST:
@@ -492,15 +512,17 @@ class CGen(object):
             return out
         if n == 0:
             return []
+        if insn.op == Op.ICALL and len(insn.srcs) > 0 and insn.srcs[0].is_var and insn.srcs[0].reg == regs.ARG_FIRST:
+            return []
 
-        # Variadic, unknown arity, or ICALL: determine from active setup (ver > 0)
+        # Variadic, unknown arity, or ICALL: determine from active setup
         out = []
         for i in range(len(by_reg)):
             r = regs.ARG_FIRST + i
             v = by_reg.get(r)
             if v is None:
                 break
-            if v.ver > 0:
+            if _is_active_arg(v, defs, self.params):
                 out.append(v)
             else:
                 break
@@ -738,6 +760,28 @@ class CGen(object):
                 sym, rhs = "-", rhs[1:]
             text = "%s %s %s" % (lhs, sym, rhs)
             return text if top else "(%s)" % text
+
+        if op in (Op.ADDX, Op.SUBX) and len(insn.srcs) >= 2:
+            lhs = self.operand(insn.srcs[0], depth, True)
+            rhs = self.operand(insn.srcs[1], depth, True)
+            lhs = self._byte_ptr(insn.srcs[0], lhs)
+            rhs = self._byte_ptr(insn.srcs[1], rhs)
+            sym = "+" if op == Op.ADDX else "-"
+            if op == Op.ADDX and insn.srcs[1].is_const and rhs.startswith("-"):
+                sym, rhs = "-", rhs[1:]
+            text = "%s %s %s" % (lhs, sym, rhs)
+            return text if top else "(%s)" % text
+
+        if op == Op.EXTS and len(insn.srcs) == 1:
+            arg = self.operand(insn.srcs[0], depth, sc)
+            if not arg.isidentifier() and not (arg.startswith("(") and arg.endswith(")")):
+                arg = "(%s)" % arg
+            if insn.ew == EW.H:
+                return "(short)(char)%s" % arg
+            if insn.ew == EW.W:
+                return "(int)(short)%s" % arg
+            if insn.ew == EW.D:
+                return "(long long)(int)%s" % arg
 
         name = OP_NAME.get(op, "op%d" % int(op))
         if op in _EW_CALLS:
@@ -1295,6 +1339,49 @@ class CGen(object):
         # constant or unused stack address computation read by nothing real
         # carries no information wherever it sits, so drop those too.
         cone |= {k for k in dead if defs[k].op in (Op.CONST, Op.ADD)}
+
+        # 3. Arithmetic carry/borrow idioms feeding ADDX/SUBX.
+        uses_of = {}
+        for insn in self.func.insns():
+            for u in insn.uses():
+                uses_of.setdefault(u.key(), []).append(insn)
+
+        all_carry_ops = set()
+        cand_by_insn = {}
+        for insn in self.func.insns():
+            if insn.op in (Op.ADDX, Op.SUBX) and len(insn.srcs) >= 3:
+                c_var = insn.srcs[2]
+                if not c_var.is_var or c_var.key() not in defs:
+                    continue
+                c_def = defs[c_var.key()]
+                cands = []
+                if c_def.op == Op.SHUFB:
+                    cands.append(c_def)
+                    for s in c_def.srcs[:2]:
+                        if s.is_var and s.key() in defs:
+                            s_def = defs[s.key()]
+                            if s_def.op in (Op.CG, Op.BG, Op.CGX, Op.BGX):
+                                cands.append(s_def)
+                    if len(c_def.srcs) > 2 and c_def.srcs[2].is_var and c_def.srcs[2].key() in defs:
+                        m_def = defs[c_def.srcs[2].key()]
+                        if m_def.op in (Op.LOAD, Op.LOADQ, Op.CONST):
+                            cands.append(m_def)
+                elif c_def.op in (Op.CG, Op.BG, Op.CGX, Op.BGX):
+                    cands.append(c_def)
+                cand_by_insn[id(insn)] = cands
+                for c in cands:
+                    all_carry_ops.add(id(c))
+                all_carry_ops.add(id(insn))
+
+        for cands in cand_by_insn.values():
+            for cand in cands:
+                d = cand.defines()
+                if d is None:
+                    continue
+                users = uses_of.get(d.key(), [])
+                if all(id(u) in all_carry_ops for u in users):
+                    cone.add(d.key())
+
         return cone
 
     def _suppressed(self, insn, d):
@@ -1499,6 +1586,7 @@ class CGen(object):
     def _simplify_cond(self, val, k):
         cur = val
         chain_eas = []
+        chain_insns = []
         seen = set()
         while cur.is_var and cur.key() in self.defs and cur.key() not in seen:
             seen.add(cur.key())
@@ -1506,11 +1594,13 @@ class CGen(object):
             if d.op == Op.MOV and len(d.srcs) == 1:
                 if getattr(d, "ea", None) is not None:
                     chain_eas.append(d.ea)
+                chain_insns.append(d)
                 cur = d.srcs[0]
                 continue
             if d.op == Op.EXTS and d.ew in (EW.H, EW.W) and len(d.srcs) == 1:
                 if getattr(d, "ea", None) is not None:
                     chain_eas.append(d.ea)
+                chain_insns.append(d)
                 cur = d.srcs[0]
                 continue
             break
@@ -1522,6 +1612,8 @@ class CGen(object):
                     chain_eas.append(d.ea)
                 self._current_inlined_eas.extend(chain_eas)
                 self._suppressed_call_undefs.add(id(d))
+                for ch_insn in chain_insns:
+                    self._suppressed_call_undefs.add(id(ch_insn))
                 is_zero = (k in ("z", "hz"))
                 lhs = self.operand(d.srcs[0], 0, True, want_scalar=True)
                 rhs = self.operand(d.srcs[1], 0, True, want_scalar=True)
@@ -1702,26 +1794,35 @@ def _real_uses(func, seed=()):
     for insn in func.insns():
         if insn.op in ABI_OPS:
             continue
+        if insn.op == Op.MOV and getattr(insn, "comment", None) == "merge":
+            continue
         for u in insn.uses():
             if insn.op == Op.PHI:
                 consumers.setdefault(u.key(), []).append(insn)
             else:
                 real.add(u.key())
 
-    # A phi result being real makes its arguments real, transitively.
+    # A phi or merge copy result being real makes its arguments real, transitively.
     changed = True
     while changed:
         changed = False
         for insn in func.insns():
-            if insn.op != Op.PHI:
-                continue
-            d = insn.defines()
-            if d is None or d.key() not in real:
-                continue
-            for u in insn.uses():
-                if u.key() not in real:
-                    real.add(u.key())
-                    changed = True
+            if insn.op == Op.PHI:
+                d = insn.defines()
+                if d is None or d.key() not in real:
+                    continue
+                for u in insn.uses():
+                    if u.key() not in real:
+                        real.add(u.key())
+                        changed = True
+            elif insn.op == Op.MOV and getattr(insn, "comment", None) == "merge":
+                d = insn.defines()
+                if d is None or d.key() not in real:
+                    continue
+                for u in insn.uses():
+                    if u.key() not in real:
+                        real.add(u.key())
+                        changed = True
     return real
 
 

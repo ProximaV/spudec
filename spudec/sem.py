@@ -275,7 +275,7 @@ def evaluate(op, ew, args, aux=None):
                          zip(lanes(a, ew), lanes(b, ew), lanes(t, ew))], ew)
         if op == Op.SUBX:
             a, b, t = args
-            return pack([(y + (~x & full) + (c & 1)) & full for x, y, c in
+            return pack([(x + (~y & full) + (c & 1)) & full for x, y, c in
                          zip(lanes(a, ew), lanes(b, ew), lanes(t, ew))], ew)
         if op == Op.CGX:
             a, b, t = args
