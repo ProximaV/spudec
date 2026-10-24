@@ -35,7 +35,7 @@ No IDA imports; pass ``name_of`` to resolve call targets to real symbol names.
 """
 
 from .ir import (Op, EW, OP_NAME, INFIX, MEM_READS, MEM_WRITES, ABI_OPS,
-                 EW_SUFFIX)
+                 EW_SUFFIX, Var)
 from . import regs, channels, types, frame, outssa
 from .structure import (Basic, If, Loop, Break, Continue, Goto, Label,
                         Return, Tail)
@@ -649,7 +649,62 @@ class CGen(object):
                             want_scalar=want_scalar, strings=strings)
         return self.nm(v)
 
+    def _stack_indexed_addr(self, v, depth=0):
+        if self._slots is None:
+            self._slots = self._slot_types()
+        if not self._slots:
+            return None
+        from .scalarize import addr_expr, word0
+
+        cur = v
+        if cur.is_var and cur.key() in self.defs:
+            d = self.defs[cur.key()]
+            if (d.op == Op.AND and len(d.srcs) == 2 and d.srcs[1].is_const
+                    and word0(d.srcs[1].val) in (0x3FFF0, 0x3FFFF)):
+                cur = d.srcs[0]
+
+        if not (cur.is_var and cur.key() in self.defs):
+            return None
+        d = self.defs[cur.key()]
+        if d.op != Op.ADD or d.ew != EW.W or len(d.srcs) != 2:
+            return None
+
+        sp_in = (regs.SP, 0)
+        s1, s2 = d.srcs
+        for sp_term, idx_term in [(s1, s2), (s2, s1)]:
+            b_sp, off_sp, _ = addr_expr(sp_term, self.defs)
+            if b_sp == sp_in:
+                b_idx, off_idx, _ = addr_expr(idx_term, self.defs)
+                if b_idx is not None and b_idx != sp_in:
+                    tot_off = (off_sp + off_idx) & 0xFFFFFFFF
+                    slot_base = tot_off & ~0xF
+                    byte_off = tot_off & 0xF
+                    hit = self._slots.get((b_sp, slot_base))
+                    if hit is None:
+                        hit = self._slots.get((b_sp, tot_off))
+                        byte_off = 0
+                    if hit is None:
+                        from . import frame
+                        signed_off = frame.signed_offset(slot_base)
+                        if signed_off != 0 and (self.frame.size is None or -self.frame.size <= signed_off <= 0x40):
+                            name = "var_%X" % abs(signed_off) if signed_off < 0 else "arg_%X" % signed_off
+                            hit = (name, "qword", EW.Q)
+                            self._slots[(b_sp, slot_base)] = hit
+                    if hit is not None:
+                        self.stack_decls[hit[0]] = hit[1]
+                        slot_name = self.user_renames.get(hit[0], hit[0])
+                        idx_var = Var(b_idx[0], b_idx[1])
+                        idx_str = self.operand(idx_var, depth, True, want_scalar=True)
+                        if byte_off == 0:
+                            return "(char *)&%s + %s" % (slot_name, idx_str)
+                        else:
+                            return "(char *)&%s + %s + 0x%X" % (slot_name, idx_str, byte_off)
+        return None
+
     def addr(self, v, depth=0, strings=True):
+        stk_idx = self._stack_indexed_addr(v, depth)
+        if stk_idx is not None:
+            return stk_idx
         if v.is_const:
             if strings:
                 lit = self.str_of(v.val >> 96)
@@ -936,11 +991,32 @@ class CGen(object):
             if any(k in mask_str for k in ("23910", "23920", "23930", "23940")):
                 a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
                 return "aes_inv_shift_rows(%s)" % a_str
+            if any(k in mask_str for k in ("CAE0", "cae0")):
+                a_str = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
+                return "aes_inv_mix_columns(%s)" % a_str
             if insn.srcs[2].is_var and insn.srcs[2].key() in self.defs:
                 c_insn = self.defs[insn.srcs[2].key()]
                 if c_insn.op == Op.GENCTL:
                     val_s = self.operand(insn.srcs[0], depth, sc, want_scalar=True)
                     old_s = self.operand(insn.srcs[1], depth, sc, want_scalar=False)
+                    from .scalarize import addr_expr, word0, _slot_of
+                    ca = addr_expr(c_insn.srcs[0], self.defs)
+                    slot = _slot_of(ca)
+                    if slot is not None:
+                        if c_insn.ew == EW.W:
+                            idx = slot // 4
+                            if old_s == "0" and idx == 0:
+                                return val_s
+                            return "vec_insert_w(%s, %s, %d)" % (val_s, old_s, idx)
+                        elif c_insn.ew == EW.H:
+                            idx = slot // 2
+                            if old_s == "0" and idx == 0:
+                                return val_s
+                            return "vec_insert_h(%s, %s, %d)" % (val_s, old_s, idx)
+                        else:
+                            if old_s == "0" and slot == 0:
+                                return val_s
+                            return "vec_insert_b(%s, %s, %d)" % (val_s, old_s, slot)
                     c_addr = self.operand(c_insn.srcs[0], depth, True, want_scalar=True)
                     if c_insn.ew == EW.W:
                         return "vec_insert_w(%s, %s, (%s & 0xF) / 4)" % (val_s, old_s, c_addr)
@@ -1215,7 +1291,7 @@ class CGen(object):
         than giving up.  So the count is recorded and stated in the header
         instead.
         """
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
 
         sp_in = (regs.SP, 0)
         # Values built from the incoming stack pointer, so an address that
@@ -1316,7 +1392,7 @@ class CGen(object):
             self._slots = self._slot_types()
         if not self._slots:
             return None
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
         d = insn.defines()
         if d is None:
             return None
@@ -1346,7 +1422,7 @@ class CGen(object):
             self._slots = self._slot_types()
         if not self._slots or len(insn.srcs) < 2:
             return None
-        from .scalarize import addr_expr
+        from .scalarize import addr_expr, word0
         base, off, _ = addr_expr(insn.srcs[1], self.defs)
         slot_base = off & ~0xF
         byte_off = off & 0xF
