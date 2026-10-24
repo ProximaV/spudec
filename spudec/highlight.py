@@ -30,6 +30,8 @@ C_TYPES = frozenset((
     "float", "double", "const", "struct", "union", "enum",
     # what this decompiler emits
     "qword", "qword_unaligned", "u8", "u16", "u32", "u64",
+    "s8", "s16", "s32", "s64", "size_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "int8_t", "int16_t", "int32_t", "int64_t", "uintptr_t", "intptr_t",
 ))
 
 # Tokens, in priority order.  `placeholder` deliberately requires a letter

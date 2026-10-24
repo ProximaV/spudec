@@ -362,6 +362,11 @@ class CGen(object):
         self.body_eas = []
         self.body_line_to_eas = {}
         self._current_inlined_eas = []
+        self.raw_param_name = {}
+        self.all_var_types = {}
+        self.sig_params = []
+        self.ret_type = "void"
+        self.sig_line_idx = None
 
         # Parameters get positional names (a1, a2, ...) the way a real
         # decompiler shows them; the register each one came from goes in the
@@ -411,6 +416,7 @@ class CGen(object):
                     reg_num = regs.ARG_FIRST + idx
                     if reg_num not in self.params:
                         self.params.append(reg_num)
+                    self.raw_param_name[reg_num] = p.name
                     p_eff_name = self.user_renames.get(p.name, p.name)
                     self.param_name[reg_num] = p_eff_name
                     pnames[(reg_num, 0)] = p_eff_name
@@ -422,6 +428,7 @@ class CGen(object):
             else:
                 ai += 1
                 nm = "a%d" % ai
+            self.raw_param_name[r] = nm
             eff_nm = self.user_renames.get(nm, nm)
             self.param_name[r] = eff_nm
             pnames[(r, 0)] = eff_nm
@@ -1483,6 +1490,13 @@ class CGen(object):
                 eff_ct = self.user_types.get(nm, self.user_types.get(eff_nm, ct))
                 stack[eff_nm] = eff_ct
 
+        for eff_nm, ct in by_name.items():
+            self.all_var_types[eff_nm] = ct
+        for eff_nm, ct in live_in.items():
+            self.all_var_types[eff_nm] = ct
+        for eff_nm, ct in stack.items():
+            self.all_var_types[eff_nm] = ct
+
         if not by_name and not live_in and not stack:
             return []
         groups = {}
@@ -2306,10 +2320,12 @@ def _params(func, arity_of=None):
 
 def _signature(g, func):
     """Return type and parameter list, from user override or recovered types."""
+    g.sig_params = []
     if g.user_proto:
         from . import abi
         parsed = abi._parse_proto(g.user_proto, func.name or ("sub_%X" % func.start_ea))
         if parsed is not None:
+            g.ret_type = parsed.ret_type
             if parsed.params:
                 plist = []
                 for p in parsed.params:
@@ -2317,24 +2333,34 @@ def _signature(g, func):
                     eff_type = g.user_types.get(p.name, g.user_types.get(eff_name, p.type_str))
                     sep = "" if eff_type.endswith("*") else " "
                     plist.append(f"{eff_type}{sep}{eff_name}")
+                    g.sig_params.append((eff_name, eff_type))
+                    g.all_var_types[eff_name] = eff_type
+                    g.all_var_types[p.name] = eff_type
                 return parsed.ret_type, ", ".join(plist)
             else:
                 return parsed.ret_type, "void"
 
     plist = []
     for r in g.params:
-        raw_nm = g.param_name[r]
-        nm = g.user_renames.get(raw_nm, raw_nm)
+        raw_nm = getattr(g, "raw_param_name", {}).get(r, g.param_name[r])
+        nm = g.param_name[r]
         # The implicit `this` is a pointer to the class, whatever demand
         # analysis made of r3 (it is usually only forwarded, so it types as a
         # bare word); the name says what it points at.
         if r == g.this_reg:
-            plist.append("%s *%s" % (g.member_class, nm))
+            p_type = "%s *" % g.member_class
+            plist.append("%s%s" % (p_type, nm))
+            g.sig_params.append((nm, p_type))
+            g.all_var_types[nm] = p_type
+            g.all_var_types[raw_nm] = p_type
             continue
         ty = g.types.of((r, 0)) if g.types is not None else None
         ct = g.ctype(ty)
         ct = g.user_types.get(raw_nm, g.user_types.get(nm, ct))
         plist.append("%s%s%s" % (ct, "" if ct.endswith("*") else " ", nm))
+        g.sig_params.append((nm, ct))
+        g.all_var_types[nm] = ct
+        g.all_var_types[raw_nm] = ct
 
     # The return type is whatever r3 holds where the function returns, or user override
     if "__return__" in g.user_types:
@@ -2348,6 +2374,8 @@ def _signature(g, func):
                 if s.is_var and s.reg == regs.ARG_FIRST and s.ver != 0:
                     ret = g.ctype(g.type_of(s), "qword")
                     break
+    g.ret_type = ret
+    g.all_var_types["__return__"] = ret
     return ret, (", ".join(plist) or "void")
 
 
@@ -2480,5 +2508,12 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
                         out.line_to_eas.setdefault(chosen, []).append(item_ea)
     except Exception:
         pass
+
+    out.var_types = dict(g.all_var_types)
+    out.params = [p[0] for p in g.sig_params]
+    out.param_types = dict(g.sig_params)
+    out.sig_line = proto_lineno
+    out.func_name = name
+    out.ret_type = ret
 
     return out

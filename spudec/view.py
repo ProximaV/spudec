@@ -135,17 +135,24 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self.ea_to_line = {}
         self.raw_lines = []
         self.header_count = 0
+        self.var_types = {}
+        self.params = []
+        self.param_types = {}
+        self.sig_line = None
+        self.ret_type = "void"
         self._selected_line = None
         self._highlighted_asm_eas = set()
         self._sync_lock = False
         self.sync_with_disasm = db.get_sync_enabled()
 
-    def build_or_refresh(self, target, mode=None):
+    def build_or_refresh(self, target, mode=None, preserve_cursor=False):
         """Populate or update lines with decompiled Function or EA."""
         import spudec
 
         if mode is not None:
             self.mode = mode
+
+        saved_pos = self.GetPos() if preserve_cursor else None
 
         if isinstance(target, int):
             try:
@@ -171,6 +178,11 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             self.line_to_eas = getattr(lines, "line_to_eas", {}) or {}
             self.ea_to_line = getattr(lines, "ea_to_line", {}) or {}
             self.raw_lines = list(lines)
+            self.var_types = getattr(lines, "var_types", {}) or {}
+            self.params = getattr(lines, "params", []) or []
+            self.param_types = getattr(lines, "param_types", {}) or {}
+            self.sig_line = getattr(lines, "sig_line", None)
+            self.ret_type = getattr(lines, "ret_type", "void")
             self._selected_line = None
 
             self.ClearLines()
@@ -192,7 +204,13 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             except Exception:
                 pass
 
-            if initial_stmt_line is not None and initial_stmt_line < len(self.raw_lines):
+            if saved_pos and 0 <= saved_pos[0] < len(self.raw_lines):
+                self.select_line(saved_pos[0], jump=True, update_asm=True, jump_asm=False)
+                try:
+                    self.Jump(saved_pos[0], saved_pos[1])
+                except Exception:
+                    pass
+            elif initial_stmt_line is not None and initial_stmt_line < len(self.raw_lines):
                 self.select_line(initial_stmt_line, jump=True, update_asm=True, jump_asm=False)
             else:
                 self._selected_line = None
@@ -206,6 +224,11 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             self.line_to_eas = {}
             self.ea_to_line = {}
             self.raw_lines = []
+            self.var_types = {}
+            self.params = []
+            self.param_types = {}
+            self.sig_line = None
+            self.ret_type = "void"
             self._selected_line = None
             self.ClearLines()
             self.line_ea = []
@@ -446,26 +469,26 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self.clear_asm_highlights()
         return super().Close()
 
-    def show_func(self, ea):
+    def show_func(self, ea, preserve_cursor=False):
         """Decompile function at ea and refresh view."""
         import spudec
         pfn = ida_funcs.get_func(ea)
         entry = pfn.start_ea if pfn else ea
         spudec.clear_caches()
-        return self.build_or_refresh(entry, mode=self.mode)
+        return self.build_or_refresh(entry, mode=self.mode, preserve_cursor=preserve_cursor)
 
     def get_word_under_cursor(self):
-        """Return the identifier under cursor and the line number."""
+        """Return (word, lineno, col) under cursor."""
         pos = self.GetPos()
         if not pos:
             word = self.GetCurrentWord()
-            return word or "", 0
+            return word or "", 0, 0
         lineno, col = pos[0], pos[1]
         if lineno < 0 or lineno >= len(self.raw_lines):
-            return "", lineno
+            return "", lineno, col
         line = self.raw_lines[lineno]
         if not line:
-            return "", lineno
+            return "", lineno, col
         if col < 0:
             col = 0
         elif col >= len(line):
@@ -477,7 +500,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             elif col + 1 < len(line) and (line[col + 1].isalnum() or line[col + 1] == "_"):
                 col += 1
             else:
-                return "", lineno
+                return "", lineno, col
 
         start = col
         while start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
@@ -485,37 +508,136 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         end = col
         while end < len(line) and (line[end].isalnum() or line[end] == "_"):
             end += 1
-        return line[start:end], lineno
+        return line[start:end], lineno, col
+
+    def _validate_c_type(self, type_str):
+        """Validate type_str against IDA type library (native SPU types, structs, typedefs)."""
+        try:
+            import ida_typeinf
+            tif = ida_typeinf.tinfo_t()
+            clean = type_str.strip().rstrip(";")
+            if ida_typeinf.parse_decl(tif, None, clean + ";", ida_typeinf.PT_TYP):
+                return True
+            if ida_typeinf.parse_decl(tif, None, f"{clean} dummy;", ida_typeinf.PT_SIL) is not None:
+                return True
+            return False
+        except Exception:
+            return True
+
+    def _update_param_type(self, param_name, new_type):
+        """Update a single parameter's type in prototype and IDA type info."""
+        data = db.get_func_data(self.current_func_ea)
+        proto_str = data.get("proto")
+        if not proto_str and self.sig_line is not None and self.sig_line < len(self.raw_lines):
+            proto_str = self.raw_lines[self.sig_line].strip()
+        if not proto_str:
+            proto_str = f"{self.ret_type} {self.current_func_name}()"
+
+        from . import abi
+        parsed = abi._parse_proto(proto_str, self.current_func_name)
+        if parsed:
+            found = False
+            for p in parsed.params:
+                if p.name == param_name:
+                    p.type_str = new_type if new_type else "qword"
+                    found = True
+                    break
+            if not found and new_type:
+                parsed.params.append(abi.Param(name=param_name, type_str=new_type))
+
+            pstrs = []
+            for p in parsed.params:
+                sep = "" if p.type_str.endswith("*") else " "
+                pstrs.append(f"{p.type_str}{sep}{p.name}")
+            new_proto = f"{parsed.ret_type} {parsed.name}({', '.join(pstrs)})"
+            db.set_func_proto(self.current_func_ea, new_proto)
+            db.set_var_type(self.current_func_ea, param_name, new_type if new_type else None)
+            try:
+                tif = ida_typeinf.tinfo_t()
+                if ida_typeinf.parse_decl(tif, None, new_proto + ";", ida_typeinf.PT_SIL):
+                    ida_typeinf.apply_tinfo(self.current_func_ea, tif, ida_typeinf.TINFO_DEFINITE)
+            except Exception:
+                pass
+        else:
+            db.set_var_type(self.current_func_ea, param_name, new_type if new_type else None)
 
     def on_rename(self):
-        """Rename variable or function under cursor and persist in IDB netnode."""
+        """Rename variable, argument, or function under cursor and persist in IDB netnode."""
         import spudec
         if self.current_func_ea is None:
             return
-        word, lineno = self.get_word_under_cursor()
+        word, lineno, col = self.get_word_under_cursor()
         if not word:
-            word = ida_kernwin.ask_str("", 0, "Enter variable name to rename")
+            word = ida_kernwin.ask_str("", 0, "Enter identifier to rename")
             if not word:
                 return
 
-        new_name = ida_kernwin.ask_str(word, 0, f"Rename '{word}' in {self.current_func_name or 'function'}")
+        # 1. Renaming the function itself
+        if word == self.current_func_name or (self.sig_line is not None and lineno == self.sig_line and word == self.current_func_name):
+            new_name = ida_kernwin.ask_str(word, 0, f"Rename Function '{word}'")
+            if new_name is None:
+                return
+            new_name = new_name.strip()
+            if new_name and new_name != word:
+                import ida_name
+                ida_name.set_name(self.current_func_ea, new_name)
+                # If prototype override exists, update function name in prototype
+                data = db.get_func_data(self.current_func_ea)
+                if data.get("proto"):
+                    from . import abi
+                    parsed = abi._parse_proto(data["proto"])
+                    if parsed:
+                        pstrs = []
+                        for p in parsed.params:
+                            sep = "" if p.type_str.endswith("*") else " "
+                            pstrs.append(f"{p.type_str}{sep}{p.name}")
+                        new_proto = f"{parsed.ret_type} {new_name}({', '.join(pstrs)})"
+                        db.set_func_proto(self.current_func_ea, new_proto)
+                self.current_func_name = new_name
+            self.show_func(self.current_func_ea, preserve_cursor=True)
+            return
+
+        # 2. Renaming a parameter
+        is_param = (word in self.params) or (self.sig_line is not None and lineno == self.sig_line and "(" in self.raw_lines[lineno])
+        prompt_label = f"parameter '{word}'" if is_param else f"variable '{word}'"
+        new_name = ida_kernwin.ask_str(word, 0, f"Rename {prompt_label} in {self.current_func_name}")
         if new_name is None:
             return
         new_name = new_name.strip()
 
-        # If renaming the function itself
-        if word == self.current_func_name or (lineno == 0 and ("(" in self.raw_lines[0])):
-            import ida_name
-            if new_name:
-                ida_name.set_name(self.current_func_ea, new_name)
-                self.current_func_name = new_name
-            self.show_func(self.current_func_ea)
-            return
-
-        # Save variable rename to persistent IDB netnode
+        # Update variable / parameter rename in persistent IDB netnode
         db.set_var_rename(self.current_func_ea, word, new_name)
 
-        # If word is a global symbol in IDA, also rename in IDA's name table
+        # If a prototype override exists in db and word was a parameter, keep prototype string in sync
+        data = db.get_func_data(self.current_func_ea)
+        if data.get("proto"):
+            from . import abi
+            parsed = abi._parse_proto(data["proto"])
+            if parsed and parsed.params:
+                modified = False
+                for p in parsed.params:
+                    if p.name == word:
+                        p.name = new_name if new_name else word
+                        modified = True
+                        break
+                if modified:
+                    pstrs = []
+                    for p in parsed.params:
+                        sep = "" if p.type_str.endswith("*") else " "
+                        pstrs.append(f"{p.type_str}{sep}{p.name}")
+                    new_proto = f"{parsed.ret_type} {parsed.name}({', '.join(pstrs)})"
+                    db.set_func_proto(self.current_func_ea, new_proto)
+                    try:
+                        tif = ida_typeinf.tinfo_t()
+                        if ida_typeinf.parse_decl(tif, None, new_proto + ";", ida_typeinf.PT_SIL):
+                            ida_typeinf.apply_tinfo(self.current_func_ea, tif, ida_typeinf.TINFO_DEFINITE)
+                    except Exception:
+                        pass
+
+        # If word is a stack frame variable, also rename IDA's stack frame member
+        self._rename_frame_member(word, new_name)
+
+        # If word is a global symbol in IDA, rename it
         try:
             import ida_name, ida_idaapi
             ea = ida_name.get_name_ea(ida_idaapi.BADADDR, word)
@@ -524,11 +646,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         except Exception:
             pass
 
-        # If it's a stack frame variable, also rename in IDA's frame struct
-        self._rename_frame_member(word, new_name)
-
-        spudec.clear_caches()
-        self.show_func(self.current_func_ea)
+        self.show_func(self.current_func_ea, preserve_cursor=True)
 
     def _rename_frame_member(self, old_name, new_name):
         """Rename stack variable member in IDA's frame structure if present."""
@@ -550,45 +668,130 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             pass
 
     def on_set_type(self):
-        """Set variable type or function prototype and persist in IDB netnode."""
+        """Set variable type, parameter type, or function prototype with IDA type integration."""
         import spudec
         if self.current_func_ea is None:
             return
-        word, lineno = self.get_word_under_cursor()
-        is_sig_line = (lineno == 0) or ("(" in self.raw_lines[lineno] and ")" in self.raw_lines[lineno] and not self.raw_lines[lineno].strip().endswith(";"))
 
-        if is_sig_line or word == self.current_func_name:
+        spudec.ensure_spu_types()
+        word, lineno, col = self.get_word_under_cursor()
+        is_sig_line = (self.sig_line is not None and lineno == self.sig_line) or \
+                      (lineno == 0 and ("(" in self.raw_lines[0] and ")" in self.raw_lines[0] and not self.raw_lines[0].startswith("//")))
+
+        # Check if cursor is on the signature line
+        if is_sig_line:
+            line_str = self.raw_lines[lineno]
+            # 1. Determine if cursor is on a specific parameter in the signature
+            param_match = None
+            if word and word in self.params:
+                param_match = word
+            else:
+                # Check if col falls within any parameter span
+                if "(" in line_str and ")" in line_str:
+                    lparen = line_str.index("(")
+                    rparen = line_str.rindex(")")
+                    if lparen < col <= rparen:
+                        args_str = line_str[lparen + 1:rparen]
+                        arg_parts = args_str.split(",")
+                        curr_offset = lparen + 1
+                        for idx, part in enumerate(arg_parts):
+                            part_len = len(part)
+                            if curr_offset <= col <= curr_offset + part_len + 1:
+                                if idx < len(self.params):
+                                    param_match = self.params[idx]
+                                break
+                            curr_offset += part_len + 1
+
+            if param_match:
+                # Editing a specific parameter's type!
+                curr_type = self.param_types.get(param_match, "qword")
+                new_type = ida_kernwin.ask_str(curr_type, 0, f"Set Type for parameter '{param_match}'")
+                if new_type is None:
+                    return
+                new_type = new_type.strip()
+                if new_type:
+                    valid = self._validate_c_type(new_type)
+                    if not valid:
+                        ida_kernwin.warning(f"Warning: '{new_type}' could not be parsed by IDA's type library. Applying override anyway.")
+                self._update_param_type(param_match, new_type)
+                self.show_func(self.current_func_ea, preserve_cursor=True)
+                return
+
+            # 2. Check if cursor is on return type in signature
+            if word and word == self.ret_type:
+                new_ret = ida_kernwin.ask_str(self.ret_type, 0, f"Set Return Type for {self.current_func_name}")
+                if new_ret is None:
+                    return
+                new_ret = new_ret.strip()
+                if new_ret:
+                    valid = self._validate_c_type(new_ret)
+                    if not valid:
+                        ida_kernwin.warning(f"Warning: '{new_ret}' could not be parsed by IDA. Applying override anyway.")
+                    db.set_var_type(self.current_func_ea, "__return__", new_ret)
+                    # Also update prototype if present
+                    data = db.get_func_data(self.current_func_ea)
+                    if data.get("proto"):
+                        from . import abi
+                        parsed = abi._parse_proto(data["proto"], self.current_func_name)
+                        if parsed:
+                            pstrs = []
+                            for p in parsed.params:
+                                sep = "" if p.type_str.endswith("*") else " "
+                                pstrs.append(f"{p.type_str}{sep}{p.name}")
+                            new_proto = f"{new_ret} {parsed.name}({', '.join(pstrs)})"
+                            db.set_func_proto(self.current_func_ea, new_proto)
+                            try:
+                                tif = ida_typeinf.tinfo_t()
+                                if ida_typeinf.parse_decl(tif, None, new_proto + ";", ida_typeinf.PT_SIL):
+                                    ida_typeinf.apply_tinfo(self.current_func_ea, tif, ida_typeinf.TINFO_DEFINITE)
+                            except Exception:
+                                pass
+                else:
+                    db.set_var_type(self.current_func_ea, "__return__", None)
+                self.show_func(self.current_func_ea, preserve_cursor=True)
+                return
+
+            # 3. Cursor is on the function name or general signature line -> edit full prototype
             data = db.get_func_data(self.current_func_ea)
-            curr_proto = data.get("proto") or (self.raw_lines[0] if self.raw_lines else "")
+            curr_proto = data.get("proto") or line_str.strip()
             new_proto = ida_kernwin.ask_str(curr_proto, 0, f"Set Function Prototype for {self.current_func_name}")
             if new_proto is None:
                 return
             new_proto = new_proto.strip()
-            db.set_func_proto(self.current_func_ea, new_proto)
+            if not new_proto:
+                db.set_func_proto(self.current_func_ea, None)
+            else:
+                # Validate prototype with IDA
+                tif = ida_typeinf.tinfo_t()
+                valid = ida_typeinf.parse_decl(tif, None, new_proto + ";", ida_typeinf.PT_SIL)
+                if not valid:
+                    ida_kernwin.warning(f"Warning: Prototype '{new_proto}' could not be parsed by IDA. Storing override anyway.")
+                db.set_func_proto(self.current_func_ea, new_proto)
+                if valid:
+                    try:
+                        ida_typeinf.apply_tinfo(self.current_func_ea, tif, ida_typeinf.TINFO_DEFINITE)
+                    except Exception:
+                        pass
 
-            if new_proto:
-                try:
-                    ida_typeinf.apply_cdecl(None, self.current_func_ea, new_proto)
-                except Exception:
-                    pass
-
-            spudec.clear_caches()
-            self.show_func(self.current_func_ea)
+            self.show_func(self.current_func_ea, preserve_cursor=True)
             return
 
+        # Cursor is on a local variable, live-in, or stack variable in the body
         if not word:
             return
 
-        data = db.get_func_data(self.current_func_ea)
-        curr_type = data.get("types", {}).get(word, "qword")
+        curr_type = self.var_types.get(word, "qword")
         new_type = ida_kernwin.ask_str(curr_type, 0, f"Set Type for variable '{word}'")
         if new_type is None:
             return
         new_type = new_type.strip()
-        db.set_var_type(self.current_func_ea, word, new_type)
+        if new_type:
+            valid = self._validate_c_type(new_type)
+            if not valid:
+                ida_kernwin.warning(f"Warning: '{new_type}' could not be parsed by IDA's type library. Applying override anyway.")
 
-        spudec.clear_caches()
-        self.show_func(self.current_func_ea)
+        db.set_var_type(self.current_func_ea, word, new_type if new_type else None)
+        self.show_func(self.current_func_ea, preserve_cursor=True)
 
     def toggle_sync(self):
         """Toggle synchronization with IDA disassembly view."""
@@ -610,7 +813,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
 
     def jump_disasm(self):
         """Jump to the linear address or switch decompiler view to callee function."""
-        word, lineno = self.get_word_under_cursor()
+        word, lineno, col = self.get_word_under_cursor()
         if word:
             # 1. Check if word is a function in IDA -> click-through navigation!
             try:

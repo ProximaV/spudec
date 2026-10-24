@@ -406,8 +406,44 @@ def clear_caches():
     clear_param_demand()
 
 
+def ensure_spu_types():
+    """Register SPU native types in IDA's type library so IDA's type engine recognises them."""
+    try:
+        import ida_typeinf
+        header = """
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+typedef signed char s8;
+typedef signed short s16;
+typedef signed int s32;
+typedef signed long long s64;
+
+typedef struct { unsigned char b[16]; } qword;
+typedef struct { unsigned char b[16]; } vec_uchar16;
+typedef struct { signed char b[16]; } vec_char16;
+typedef struct { unsigned short h[8]; } vec_ushort8;
+typedef struct { signed short h[8]; } vec_short8;
+typedef struct { unsigned int w[4]; } vec_uint4;
+typedef struct { signed int w[4]; } vec_int4;
+typedef struct { unsigned long long d[2]; } vec_ullong2;
+typedef struct { signed long long d[2]; } vec_llong2;
+typedef struct { float f[4]; } vec_float4;
+typedef struct { double d[2]; } vec_double2;
+typedef struct { unsigned char b[16]; } qword_unaligned;
+"""
+        ida_typeinf.parse_decls(None, header, None, ida_typeinf.HTI_DCL)
+    except Exception:
+        pass
+
+
+ensure_spu_types()
+
+
 def pseudocode(ea, name_of=None, arity=None, str_of=None,
-               stk_of=None, this_of=None, sym_of=None, **kw):
+               stk_of=None, this_of=None, sym_of=None,
+               user_renames=None, user_types=None, user_proto=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -422,9 +458,35 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
     resolves a function to the class it is a member of, so its r3 prints as
     ``this``.
     """
-    from . import cgen
+    from . import cgen, db
     func = ea if isinstance(ea, Function) else decompile(ea, **kw)
     stmts, info = structured(func)
+
+    # Load persistent overrides from IDB netnode when not explicitly supplied
+    fn_ea = getattr(func, "start_ea", None)
+    if fn_ea is not None:
+        db_data = db.get_func_data(fn_ea)
+        if user_renames is None:
+            user_renames = dict(db_data.get("renames", {}))
+        if user_types is None:
+            user_types = dict(db_data.get("types", {}))
+        if user_proto is None:
+            user_proto = db_data.get("proto")
+
+        # If prototype override is not set in netnode, check if IDA has a prototype
+        if user_proto is None:
+            try:
+                import ida_nalt, ida_typeinf
+                tif = ida_typeinf.tinfo_t()
+                if ida_nalt.get_tinfo(tif, fn_ea) and tif.is_func():
+                    fn_name = func.name or ("sub_%X" % fn_ea)
+                    d = tif.dstr()
+                    if "(" in d:
+                        ret_part, args_part = d.split("(", 1)
+                        user_proto = "%s %s(%s" % (ret_part.strip(), fn_name, args_part)
+            except Exception:
+                pass
+
     if arity is None:
         arity = arity_of
     if str_of is None:
@@ -439,4 +501,6 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
         sym_of = symbols()
     return cgen.generate(func, stmts, info, name_of=name_of, arity_of=arity,
                          str_of=str_of, stk_of=stk_of, this_of=this_of,
-                         sym_of=sym_of)
+                         sym_of=sym_of,
+                         user_renames=user_renames, user_types=user_types,
+                         user_proto=user_proto)
