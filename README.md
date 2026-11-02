@@ -23,7 +23,7 @@ flowchart TD
 ## Key Capabilities & Features
 
 ### 1. Interactive Decompiler View & UX
-- **Official IDA Decompiler Plugin**: Registered with IDA Pro as a decompiler plugin (`PLUGIN_PROC`) that triggers automatically via **`F5`** (with `Ctrl-Shift-S` as a backwards-compatible alias).
+- **Proper IDA Decompiler Plugin**: Registered with IDA Pro as a decompiler plugin (`PLUGIN_PROC`) that triggers automatically via **`F5`** (with `Ctrl-Shift-S` as a backwards-compatible alias).
 - **Dockable Synchronized Viewer**: Opens with `F5` on any function or cursor address, integrating into menus (`View -> Open subviews -> Generate pseudocode`, `Edit -> Plugins -> SPU decompiler (spudec)`) and disassembly right-click context menus (`Decompile`).
 - **Bidirectional Disassembly Synchronization**: Hovering or clicking in pseudocode immediately highlights corresponding assembly instructions in IDA's disassembly window, and vice versa.
 - **Interactive In-Place Renaming (`N`)**: Rename variables, parameters, symbols, and stack frame members with instant live updates throughout the pseudocode.
