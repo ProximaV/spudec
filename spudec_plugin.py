@@ -6,7 +6,8 @@ each other into IDA's user plugin directory:
 
     %APPDATA%\\Hex-Rays\\IDA Pro\\plugins\\
 
-    Ctrl-Shift-S   decompile the function under the cursor
+    F5             decompile the function under the cursor (or refresh)
+    Ctrl-Shift-S   legacy decompile shortcut
     Ctrl-F5        decompile everything in the database
 
 The patched ``spu.py`` belongs in %APPDATA%\\Hex-Rays\\IDA Pro\\procs\\ .
@@ -28,8 +29,13 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 
-HOTKEY_ONE = "Ctrl-Shift-S"
+HOTKEY_DECOMPILE = "F5"
+HOTKEY_LEGACY = "Ctrl-Shift-S"
 HOTKEY_ALL = "Ctrl-F5"
+
+ACTION_DECOMPILE = "spudec:decompile"
+MENU_PSEUDOCODE_PATH = "View/Open subviews/Generate pseudocode"
+MENU_PLUGIN_PATH = "Edit/Plugins/SPU decompiler (spudec)"
 
 # Viewers must outlive run(); IDA does not hold a reference for us.
 _views = []
@@ -71,20 +77,26 @@ def _run_one():
         return
 
     ea = ida_kernwin.get_screen_ea()
-    f = ida_funcs.get_func(ea)
-    if f is None:
+    f = ida_funcs.get_func(ea) if (ea is not None and ea != idaapi.BADADDR) else None
+
+    # If the pseudocode viewer is active and focused, get_screen_ea() can be BADADDR
+    if f is None and getattr(view, "_active_viewer", None) is not None and view._active_viewer.current_func_ea is not None:
+        start_ea = view._active_viewer.current_func_ea
+    elif f is not None:
+        start_ea = f.start_ea
+    else:
         ida_kernwin.warning("spudec: no function at 0x%X.\n"
-                            "Create one with 'P' first." % ea)
+                            "Create one with 'P' first." % (ea if ea is not None else 0))
         return
 
     try:
-        func = spudec.decompile(f.start_ea, check=True)
+        func = spudec.decompile(start_ea, check=True)
     except Exception:
         ida_kernwin.warning("spudec failed:\n\n%s" % traceback.format_exc())
         return
 
     v = view.show(func)
-    if v is not None:
+    if v is not None and v not in _views:
         _views.append(v)
 
     n = sum(len(b.insns) for b in func.blocks)
@@ -189,35 +201,92 @@ def _run_all():
 
 
 # ---------------------------------------------------------------------------
+# UI action handler for F5 decompile
+# ---------------------------------------------------------------------------
+
+
+class _DecompileActionHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        _run_one()
+        return 1
+
+    def update(self, ctx):
+        if ida_idp.ph_get_id() != ida_idp.PLFM_SPU:
+            return ida_kernwin.AST_DISABLE_ALWAYS
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+def _register_actions():
+    ida_kernwin.unregister_action(ACTION_DECOMPILE)
+    desc = ida_kernwin.action_desc_t(
+        ACTION_DECOMPILE,
+        "SPU Pseudocode",
+        _DecompileActionHandler(),
+        HOTKEY_DECOMPILE,
+        "Decompile current SPU function to pseudocode (F5)",
+        -1
+    )
+    if ida_kernwin.register_action(desc):
+        ida_kernwin.attach_action_to_menu(MENU_PSEUDOCODE_PATH, ACTION_DECOMPILE, ida_kernwin.SETMENU_APP)
+        ida_kernwin.attach_action_to_menu(MENU_PLUGIN_PATH, ACTION_DECOMPILE, ida_kernwin.SETMENU_APP)
+
+
+def _unregister_actions():
+    try:
+        ida_kernwin.detach_action_from_menu(MENU_PSEUDOCODE_PATH, ACTION_DECOMPILE)
+    except Exception:
+        pass
+    try:
+        ida_kernwin.detach_action_from_menu(MENU_PLUGIN_PATH, ACTION_DECOMPILE)
+    except Exception:
+        pass
+    try:
+        ida_kernwin.unregister_action(ACTION_DECOMPILE)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Plugin descriptor
+# ---------------------------------------------------------------------------
 
 
 class SpuDecPlugin(ida_idaapi.plugin_t):
-    flags = 0
-    comment = "SPU lifter + SSA IR + pseudocode (Hex-Rays has no SPU backend)"
+    flags = ida_idaapi.PLUGIN_PROC
+    comment = "This is a decompilation plugin."
     help = ("%s decompiles the current function, %s decompiles everything."
-            % (HOTKEY_ONE, HOTKEY_ALL))
+            % (HOTKEY_DECOMPILE, HOTKEY_ALL))
     wanted_name = "SPU decompiler (spudec)"
-    wanted_hotkey = HOTKEY_ONE
+    wanted_hotkey = HOTKEY_DECOMPILE
 
     def init(self):
         if ida_idp.ph_get_id() != ida_idp.PLFM_SPU:
             return ida_idaapi.PLUGIN_SKIP
-        ctx = ida_kernwin.add_hotkey(HOTKEY_ALL, _run_all)
-        if ctx is not None:
-            _hotkeys.append(ctx)
+
+        _register_actions()
+
+        for hk, fn in [(HOTKEY_DECOMPILE, _run_one),
+                       (HOTKEY_LEGACY, _run_one),
+                       (HOTKEY_ALL, _run_all)]:
+            ctx = ida_kernwin.add_hotkey(hk, fn)
+            if ctx is not None:
+                _hotkeys.append(ctx)
+
         try:
             from spudec import view
             view.init_hooks()
         except Exception:
             pass
+
         print("spudec: loaded -- %s = this function, %s = decompile all"
-              % (HOTKEY_ONE, HOTKEY_ALL))
+              % (HOTKEY_DECOMPILE, HOTKEY_ALL))
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         _run_one()
 
     def term(self):
+        _unregister_actions()
         try:
             from spudec import view
             view.cleanup()
@@ -234,3 +303,4 @@ class SpuDecPlugin(ida_idaapi.plugin_t):
 
 def PLUGIN_ENTRY():
     return SpuDecPlugin()
+

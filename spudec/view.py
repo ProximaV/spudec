@@ -27,6 +27,7 @@ _EA = re.compile(r"\b(?:loc_|sub_)([0-9A-Fa-f]+)\b")
 _ADDR_HEX = re.compile(r"\b0x([0-9A-Fa-f]{3,8})\b")
 _VIEW_TITLE = "spudec - Pseudocode"
 
+ACTION_DECOMPILE = "spudec:decompile"
 ACTION_RENAME = "spudec:rename_var"
 ACTION_SET_TYPE = "spudec:set_type"
 ACTION_TOGGLE_SYNC = "spudec:toggle_sync"
@@ -1101,6 +1102,11 @@ class _UiHooks(ida_kernwin.UI_Hooks):
 
     def finish_populating_widget_popup(self, widget, popup_handle):
         """Attach decompiler context actions to the right-click popup menu."""
+        wtype = ida_kernwin.get_widget_type(widget)
+        if wtype == ida_kernwin.BWN_DISASM:
+            ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_DECOMPILE)
+            return
+
         if not self.view:
             return
         view_widget = self.view.GetWidget()
@@ -1303,7 +1309,7 @@ def cleanup():
         except Exception:
             pass
         _view_hooks = None
-    for action_id in [ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH, ACTION_TOGGLE_IR]:
+    for action_id in [ACTION_DECOMPILE, ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH, ACTION_TOGGLE_IR]:
         try:
             ida_kernwin.unregister_action(action_id)
         except Exception:

@@ -23,7 +23,8 @@ flowchart TD
 ## Key Capabilities & Features
 
 ### 1. Interactive Decompiler View & UX
-- **Dockable Synchronized Viewer**: Opens with `Ctrl-Shift-S` on any function or cursor address.
+- **Official IDA Decompiler Plugin**: Registered with IDA Pro as a decompiler plugin (`PLUGIN_PROC`) that triggers automatically via **`F5`** (with `Ctrl-Shift-S` as a backwards-compatible alias).
+- **Dockable Synchronized Viewer**: Opens with `F5` on any function or cursor address, integrating into menus (`View -> Open subviews -> Generate pseudocode`, `Edit -> Plugins -> SPU decompiler (spudec)`) and disassembly right-click context menus (`Decompile`).
 - **Bidirectional Disassembly Synchronization**: Hovering or clicking in pseudocode immediately highlights corresponding assembly instructions in IDA's disassembly window, and vice versa.
 - **Interactive In-Place Renaming (`N`)**: Rename variables, parameters, symbols, and stack frame members with instant live updates throughout the pseudocode.
 - **Type Overrides & Struct Support (`Y`)**: Apply custom C types, function prototypes, and IDA structure types (e.g., `Elf64_Phdr *`, `vec_uint4`, `qword *`), propagating through type inference.
@@ -33,9 +34,9 @@ flowchart TD
 
 | Hotkey / Action | Function |
 | :--- | :--- |
-| `Ctrl-Shift-S` | Decompile current function into a new or focused decompiler tab |
+| `F5` | Decompile current function into a new/focused pseudocode tab, or refresh |
+| `Ctrl-Shift-S` | Alternative / legacy shortcut to decompile current function |
 | `Ctrl-F5` | Batch decompile all functions in the database |
-| `F5` | Re-decompile / refresh active function |
 | `N` | Rename variable, parameter, or symbol under cursor |
 | `Y` | Set variable type or edit function prototype |
 | `Tab` | Toggle bidirectional disassembly synchronization |
@@ -134,7 +135,7 @@ The decompiler pipeline is continuously verified across complete binary firmware
    - Global: `%APPDATA%\Hex-Rays\IDA Pro\plugins\`
    - Or local: `<IDA_DIR>\plugins\`
 2. Restart IDA Pro or select **Edit $\rightarrow$ Plugins $\rightarrow$ spudec SPU Decompiler**.
-3. Press `Ctrl-Shift-S` on any SPU instruction to open the interactive decompiler.
+3. Press `F5` (or `Ctrl-Shift-S`) on any SPU instruction to open the interactive decompiler.
 
 ---
 

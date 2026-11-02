@@ -924,6 +924,102 @@ def test_byte_and_halfword_constant_formatting():
     print("ok  test_byte_and_halfword_constant_formatting")
 
 
+def test_decompiler_plugin_registration():
+    """Verify that SpuDecPlugin registers with IDA as a decompiler plugin on F5."""
+    import types
+    # Mock IDA environment if not present
+    modules_to_restore = {}
+    for mod_name in ["ida_idaapi", "ida_idp", "ida_kernwin", "ida_funcs", "idaapi", "ida_lines", "ida_typeinf"]:
+        if mod_name not in sys.modules:
+            m = types.ModuleType(mod_name)
+            sys.modules[mod_name] = m
+            modules_to_restore[mod_name] = None
+        else:
+            modules_to_restore[mod_name] = sys.modules[mod_name]
+
+    ida_idaapi = sys.modules["ida_idaapi"]
+    ida_idp = sys.modules["ida_idp"]
+    ida_kernwin = sys.modules["ida_kernwin"]
+
+    if not hasattr(ida_idaapi, "plugin_t"):
+        class _plugin_t:
+            pass
+        ida_idaapi.plugin_t = _plugin_t
+        ida_idaapi.PLUGIN_PROC = 64
+        ida_idaapi.PLUGIN_KEEP = 2
+        ida_idaapi.PLUGIN_SKIP = 0
+
+    if not hasattr(ida_kernwin, "action_handler_t"):
+        class _action_handler_t:
+            pass
+        ida_kernwin.action_handler_t = _action_handler_t
+
+    if not hasattr(ida_idp, "PLFM_SPU"):
+        ida_idp.PLFM_SPU = 59
+        ida_idp.ph_get_id = lambda: 59
+
+    actions_registered = {}
+    menus_attached = []
+    hotkeys_added = []
+
+    ida_kernwin.action_desc_t = lambda name, label, handler, shortcut, tooltip, icon: {
+        "name": name, "label": label, "handler": handler, "shortcut": shortcut, "tooltip": tooltip
+    }
+    ida_kernwin.register_action = lambda desc: actions_registered.setdefault(desc["name"], desc) or True
+    ida_kernwin.unregister_action = lambda name: actions_registered.pop(name, None)
+    ida_kernwin.attach_action_to_menu = lambda path, name, flags: menus_attached.append((path, name)) or True
+    ida_kernwin.detach_action_from_menu = lambda path, name: True
+    ida_kernwin.add_hotkey = lambda hk, fn: hotkeys_added.append((hk, fn)) or len(hotkeys_added)
+    ida_kernwin.del_hotkey = lambda ctx: True
+    ida_kernwin.AST_ENABLE_ALWAYS = 1
+    ida_kernwin.AST_DISABLE_ALWAYS = 0
+    ida_kernwin.SETMENU_APP = 1
+
+    try:
+        if "spudec_plugin" in sys.modules:
+            del sys.modules["spudec_plugin"]
+        import spudec_plugin
+
+        assert spudec_plugin.HOTKEY_DECOMPILE == "F5"
+        assert spudec_plugin.HOTKEY_LEGACY == "Ctrl-Shift-S"
+        assert spudec_plugin.ACTION_DECOMPILE == "spudec:decompile"
+
+        plugin = spudec_plugin.PLUGIN_ENTRY()
+        assert plugin.wanted_hotkey == "F5"
+        assert plugin.flags == ida_idaapi.PLUGIN_PROC
+        assert "decompilation plugin" in plugin.comment.lower()
+
+        # Test init()
+        ret = plugin.init()
+        assert ret == ida_idaapi.PLUGIN_KEEP
+
+        # Verify action and menus registered
+        assert "spudec:decompile" in actions_registered
+        desc = actions_registered["spudec:decompile"]
+        assert desc["shortcut"] == "F5"
+        assert any(m[1] == "spudec:decompile" for m in menus_attached)
+
+        # Verify hotkeys added (F5, legacy Ctrl-Shift-S, Ctrl-F5)
+        added_keys = [h[0] for h in hotkeys_added]
+        assert "F5" in added_keys
+        assert "Ctrl-Shift-S" in added_keys
+        assert "Ctrl-F5" in added_keys
+
+        # Test term()
+        plugin.term()
+        assert "spudec:decompile" not in actions_registered
+
+    finally:
+        for mod_name, old_m in modules_to_restore.items():
+            if old_m is None:
+                sys.modules.pop(mod_name, None)
+            else:
+                sys.modules[mod_name] = old_m
+        sys.modules.pop("spudec_plugin", None)
+
+    print("ok  test_decompiler_plugin_registration")
+
+
 if __name__ == "__main__":
     test_db_persistence()
     test_proto_parser()
@@ -943,4 +1039,5 @@ if __name__ == "__main__":
     test_aes_and_sha_shuffle_elimination_to_native_c()
     test_hexrays_parity_features()
     test_byte_and_halfword_constant_formatting()
+    test_decompiler_plugin_registration()
     print("\nall recover tests passed")
