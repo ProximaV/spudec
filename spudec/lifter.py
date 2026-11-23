@@ -714,11 +714,18 @@ class Lifter(object):
 
     def _halt(self, insn, name):
         cond = self.halts[name]
-        if name.endswith("i"):
-            srcs = [self.r(insn.Op2),
-                    self.const(repl(self.imm(insn.Op3), EW.W))]
+        # Native spu.dll omits the architectural false-target RT operand
+        # (Op1=RA, Op2=RB/imm), while legacy spu.py included it (Op1=RT,
+        # Op2=RA, Op3=RB/imm). Support both layouts seamlessly.
+        if insn.Op3.type == o_void:
+            op_a, op_b = insn.Op1, insn.Op2
         else:
-            srcs = [self.r(insn.Op2), self.r(insn.Op3)]
+            op_a, op_b = insn.Op2, insn.Op3
+        if name.endswith("i"):
+            srcs = [self.r(op_a),
+                    self.const(repl(self.imm(op_b), EW.W))]
+        else:
+            srcs = [self.r(op_a), self.r(op_b)]
         self.emit(Op.HALT, None, srcs, EW.W, aux=cond)
 
     # -- system ------------------------------------------------------------
@@ -816,8 +823,11 @@ class Lifter(object):
         intrinsic path trusts CF_CHG1.  That would have claimed RT is written
         and clobbered a live value, so this defines only the FPSCR.
         """
+        # Native spu.dll omits the false-target RT operand (Op1=RA), while
+        # legacy spu.py included it (Op1=RT, Op2=RA). Support both layouts.
+        op_src = insn.Op1 if insn.Op2.type == o_void else insn.Op2
         self.emit(Op.INTRINSIC, regs.R_SPR,
-                  [Var(regs.R_SPR), self.r(insn.Op2)], EW.Q, aux="fscrwr")
+                  [Var(regs.R_SPR), self.r(op_src)], EW.Q, aux="fscrwr")
 
     def _i_dftsv(self, insn, name):
         """
