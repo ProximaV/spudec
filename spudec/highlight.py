@@ -27,11 +27,14 @@ C_KEYWORDS = frozenset((
 
 C_TYPES = frozenset((
     "void", "char", "short", "int", "long", "unsigned", "signed",
-    "float", "double", "const", "struct", "union", "enum",
-    # what this decompiler emits
+    "float", "double", "bool", "_Bool", "const", "volatile", "struct", "union", "enum",
+    # what this decompiler emits & common IDA/C types
     "qword", "qword_unaligned", "u8", "u16", "u32", "u64",
-    "s8", "s16", "s32", "s64", "size_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "s8", "s16", "s32", "s64", "size_t", "ssize_t",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
     "int8_t", "int16_t", "int32_t", "int64_t", "uintptr_t", "intptr_t",
+    "__int8", "__int16", "__int32", "__int64",
+    "BYTE", "WORD", "DWORD", "QWORD", "BOOL",
 ))
 
 # Tokens, in priority order.  `placeholder` deliberately requires a letter
@@ -41,8 +44,10 @@ _TOK = re.compile(r"""
       (?P<comment>//.*)
     | (?P<placeholder><[A-Za-z][^<>]*>)
     | (?P<string>"(?:[^"\\]|\\.)*")
-    | (?P<hex>-?\b0[xX][0-9A-Fa-f]+)
-    | (?P<num>-?\b\d+\b)
+    | (?P<char>'(?:[^'\\]|\\.)+')
+    | (?P<bin>-?\b0[bB][01]+(?:[uUlL]{1,3})?\b)
+    | (?P<hex>-?\b0[xX][0-9A-Fa-f]+(?:[uUlL]{1,3})?)
+    | (?P<num>-?\b\d+(?:[uUlL]{1,3})?\b)
     | (?P<ident>[A-Za-z_$][A-Za-z_0-9$]*(?:\.[A-Za-z0-9]+)?)
     | (?P<ws>\s+)
     | (?P<op>.)
@@ -92,7 +97,9 @@ def colorize(line, highlight_ident=None):
             out.append(_tag(text, ida_lines.SCOLOR_MACRO))
         elif kind == "string":
             out.append(_tag(text, ida_lines.SCOLOR_STRING))
-        elif kind in ("hex", "num"):
+        elif kind == "char":
+            out.append(_tag(text, getattr(ida_lines, "SCOLOR_CHAR", ida_lines.SCOLOR_STRING)))
+        elif kind in ("bin", "hex", "num"):
             out.append(_tag(text, ida_lines.SCOLOR_NUMBER))
         elif kind == "ident":
             if highlight_ident and (text == highlight_ident or text.split(".")[0] == highlight_ident):

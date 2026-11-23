@@ -22,27 +22,42 @@ flowchart TD
 
 ## Key Capabilities & Features
 
-### 1. Interactive Decompiler View & UX
+### 1. Interactive Decompiler View & Hex-Rays Parity UX
 - **Proper IDA Decompiler Plugin**: Registered with IDA Pro as a decompiler plugin (`PLUGIN_PROC`) that triggers automatically via **`F5`** (with `Ctrl-Shift-S` as a backwards-compatible alias).
 - **Dockable Synchronized Viewer**: Opens with `F5` on any function or cursor address, integrating into menus (`View -> Open subviews -> Generate pseudocode`, `Edit -> Plugins -> SPU decompiler (spudec)`) and disassembly right-click context menus (`Decompile`).
-- **Bidirectional Disassembly Synchronization**: Hovering or clicking in pseudocode immediately highlights corresponding assembly instructions in IDA's disassembly window, and vice versa.
-- **Interactive In-Place Renaming (`N`)**: Rename variables, parameters, symbols, and stack frame members with instant live updates throughout the pseudocode.
-- **Type Overrides & Struct Support (`Y`)**: Apply custom C types, function prototypes, and IDA structure types (e.g., `Elf64_Phdr *`, `vec_uint4`, `qword *`), propagating through type inference.
-- **Netnode-Backed Database Persistence**: Variable renames, type definitions, user overrides, and view settings persist permanently inside the IDA database (`.idb` / `.i64`) via a dedicated netnode (`$ spudec`).
-- **Low-Level SSA IR Inspection (`I`)**: Toggle between high-level C pseudocode and low-level SSA intermediate representation for compiler-level debugging.
-- **Theme-Aware Syntax Highlighting**: Automatic adaptation to IDA Pro light and dark color schemes.
+- **Clean Navigation History (No Scroll Flooding)**: Scrolling or clicking lines within a function syncs disassembly using `UIJMP_DONTPUSH` without pushing IDA navigation points; explicit jumps (clicking callees, symbols, or `G`) push a single history entry so IDA's Back/Forward arrows, `Esc`, and `Ctrl-Enter` step cleanly between functions.
+- **Per-Constant Formatting (`H`, `A`, `R`, `B`, `_`, `~`, `O`, `M`)**: Toggle individual constants (even on multi-constant lines) between hexadecimal/decimal (`H`), ASCII string literals or character constants (`A` / `R`), binary (`B`), signed/unsigned (`_`), bitwise invert (`~`), symbol/offset (`O`), and IDA enum symbolic constants (`M`).
+- **Interactive In-Place Renaming (`N`)**: Rename variables, parameters, callee functions, global symbols, and IDA stack frame members with instant live updates throughout the pseudocode.
+- **Full Type Propagation & Struct Field Resolution (`Y`)**: Set types on local/stack variables, parameters (from signature OR body), callee prototypes, global data symbols, return types, and full C/C++ prototypes (with automatic C++ `::` declarator sanitization). Struct pointers (`Elf32_Ehdr *`), typed pointers (`u32 *`), and stack structs automatically resolve into `ptr->field`, `ptr[i]`, and `var.field` using IDA's Local Types library.
+- **Netnode-Backed Database Persistence**: Variable renames, type definitions, number formats, statement comments, inverted `if` flags, and view settings persist permanently inside the IDA database (`.idb` / `.i64`) via a dedicated netnode (`$ spudec`).
+- **Low-Level SSA IR Inspection (`Shift-I`) & Hide Casts (`\`)**: Toggle between high-level C pseudocode and low-level SSA IR, or hide redundant scalar/pointer casts for cleaner reading.
+- **Theme-Aware Syntax Highlighting**: Automatic adaptation to IDA Pro light and dark color schemes, including character and binary literals.
 
 | Hotkey / Action | Function |
 | :--- | :--- |
 | `F5` | Decompile current function into a new/focused pseudocode tab, or refresh |
 | `Ctrl-Shift-S` | Alternative / legacy shortcut to decompile current function |
 | `Ctrl-F5` | Batch decompile all functions in the database |
-| `N` | Rename variable, parameter, or symbol under cursor |
-| `Y` | Set variable type or edit function prototype |
-| `Tab` | Toggle bidirectional disassembly synchronization |
-| `Enter` / Double-click | Click-through navigation to callee or disassembly address |
-| `I` | Toggle between C pseudocode and SSA IR |
-| `Esc` | Close view and clear instruction highlights |
+| `N` | Rename variable, parameter, callee, global symbol, or function under cursor |
+| `Y` | Set type for local/stack var, parameter, global, callee prototype, or function prototype |
+| `H` | Toggle Hexadecimal ↔ Decimal on constant under cursor (or String → Hex address) |
+| `A` | Create/toggle ASCII string literal at address/symbol, or character literal on immediate |
+| `R` | Toggle Character constant (`'E'`, `'\x7FELF'`) on constant under cursor |
+| `B` | Toggle Binary (`0b...`) representation on constant under cursor |
+| `_` | Invert sign (toggle signed ↔ unsigned representation) |
+| `~` | Toggle bitwise negated constant (`~0x...`) |
+| `O` | Toggle Offset / Symbol (`&sym`) representation |
+| `M` | Replace constant with an IDA Enum / symbolic constant |
+| `/` or `;` | Add or edit statement comment |
+| `I` | Invert `if` condition and swap `then`/`else` branches |
+| `\` | Toggle Hide/Show redundant casts |
+| `X` | Open Cross-References window for symbol, function, or address under cursor |
+| `G` | Jump to arbitrary address or function |
+| `Enter` / Double-click | Click-through navigation to callee function, label, or symbol |
+| `Tab` | Switch focus to IDA Disassembly at the current statement |
+| `Esc` / `Ctrl-Enter` | Navigate Back / Forward across functions |
+| `Alt-S` | Toggle automatic disassembly synchronization |
+| `Shift-I` | Toggle between C pseudocode and SSA IR |
 
 ---
 

@@ -7,9 +7,9 @@ Stores and retrieves per-function:
 - Variable type overrides (var_name -> type_str)
 - Function prototype overrides (prototype string)
 - Statement comments (stmt_ea -> comment_str)
-- Number format overrides (stmt_ea:opnum -> 'hex' | 'dec' | 'char')
+- Number format overrides (stmt_ea:opnum -> 'hex' | 'dec' | 'char' | 'bin' | 'oct' | 'signed' | 'uhex' | 'shex' | 'sdec' | 'udec' | 'inv' | 'str' | 'nostr' | 'offset' | 'enum:<NAME>')
 - Inverted if-conditions (set of branch_ea)
-- Global UI preferences (sync with disassembly enabled)
+- Global UI preferences (sync with disassembly enabled, hide casts)
 
 When run outside IDA (headless tests), falls back to an in-memory dictionary.
 """
@@ -24,6 +24,7 @@ except ImportError:
 NODE_NAME = "$ spudec"
 _MEM_STORAGE = {}
 _MEM_SYNC = True
+_MEM_HIDE_CASTS = False
 
 
 def _get_node():
@@ -163,14 +164,21 @@ def get_statement_cmt(func_ea, stmt_ea):
 
 
 def set_numform(func_ea, stmt_ea, op_idx, form_str):
-    """Save immediate constant display format ('hex', 'dec', 'char')."""
+    """Save immediate constant display format (e.g. 'hex', 'dec', 'char', 'bin', 'inv', 'str', 'nostr', 'offset', 'enum:NAME')."""
     data = get_func_data(func_ea)
     numforms = data.setdefault("numforms", {})
     key = f"{hex(stmt_ea) if isinstance(stmt_ea, int) else str(stmt_ea)}:{op_idx}"
     if not form_str or form_str == "default":
         numforms.pop(key, None)
     else:
-        numforms[key] = form_str.lower()
+        if form_str.lower().startswith("enum:"):
+            enum_name = form_str.split(":", 1)[1].strip()
+            if not enum_name:
+                numforms.pop(key, None)
+            else:
+                numforms[key] = "enum:" + enum_name
+        else:
+            numforms[key] = form_str.lower()
     set_func_data(func_ea, data)
 
 
@@ -179,6 +187,19 @@ def get_numform(func_ea, stmt_ea, op_idx=0):
     data = get_func_data(func_ea)
     key = f"{hex(stmt_ea) if isinstance(stmt_ea, int) else str(stmt_ea)}:{op_idx}"
     return data.get("numforms", {}).get(key)
+
+
+def clear_func_overrides(func_ea):
+    """Clear all user overrides (renames, types, proto, comments, numforms, iflags) for a function."""
+    set_func_data(func_ea, {
+        "renames": {},
+        "types": {},
+        "proto": None,
+        "lvars": {},
+        "cmts": {},
+        "numforms": {},
+        "iflags": [],
+    })
 
 
 def toggle_iflag(func_ea, branch_ea):
@@ -241,11 +262,36 @@ def set_sync_enabled(enabled):
         pass
 
 
+def get_hide_casts():
+    """Retrieve global hide-casts preference (toggled with '\\')."""
+    node = _get_node()
+    if node is None:
+        return _MEM_HIDE_CASTS
+    try:
+        val = node.altval(1)
+        return val == 1
+    except Exception:
+        return False
+
+
+def set_hide_casts(enabled):
+    """Save global hide-casts preference."""
+    global _MEM_HIDE_CASTS
+    _MEM_HIDE_CASTS = bool(enabled)
+    node = _get_node()
+    if node is None:
+        return
+    try:
+        node.altset(1, 1 if enabled else 2)
+    except Exception:
+        pass
+
+
 WIN_STATE_KEY = 0x7FFFFFFF
 _MEM_WIN_STATE = {"is_open": False, "func_ea": None, "mode": "c", "lineno": 0, "col": 0}
 
 
-def save_window_state(is_open, func_ea=None, lineno=0, col=0, mode="c"):
+def save_window_state(is_open, func_ea=None, lineno=0, col=0, mode="c", persist=True):
     """Persist decompiler window state (open status, active function, cursor position)."""
     global _MEM_WIN_STATE
     state = {
@@ -256,6 +302,8 @@ def save_window_state(is_open, func_ea=None, lineno=0, col=0, mode="c"):
         "mode": mode
     }
     _MEM_WIN_STATE = state
+    if not persist:
+        return
     node = _get_node()
     if node is not None:
         try:
@@ -279,9 +327,10 @@ def load_window_state():
 
 def clear_all():
     """Clear in-memory and database storage (useful in tests)."""
-    global _MEM_STORAGE, _MEM_SYNC, _MEM_WIN_STATE
+    global _MEM_STORAGE, _MEM_SYNC, _MEM_HIDE_CASTS, _MEM_WIN_STATE
     _MEM_STORAGE.clear()
     _MEM_SYNC = True
+    _MEM_HIDE_CASTS = False
     _MEM_WIN_STATE = {"is_open": False, "func_ea": None, "mode": "c", "lineno": 0, "col": 0}
     node = _get_node()
     if node is not None:

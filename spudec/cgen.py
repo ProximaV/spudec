@@ -71,13 +71,151 @@ _BITWISE = {
 
 
 class CodeLines(list):
-    """List of generated C lines carrying parallel line_eas, line_to_eas, ea_to_line, header_count."""
+    """List of generated C lines carrying parallel EA, constant, and symbol maps."""
     def __init__(self, iterable=None):
         super(CodeLines, self).__init__(iterable or [])
         self.line_eas = []
         self.line_to_eas = {}
         self.ea_to_line = {}
+        self.line_consts = {}
+        self.call_eas = {}
+        self.sym_eas = {}
         self.header_count = 0
+        self.hide_casts = False
+
+
+_PRIM_SIZES = {
+    "char": 1, "signed char": 1, "unsigned char": 1, "u8": 1, "s8": 1,
+    "uint8_t": 1, "int8_t": 1, "bool": 1, "_Bool": 1, "BYTE": 1, "__int8": 1,
+    "short": 2, "signed short": 2, "unsigned short": 2, "u16": 2, "s16": 2,
+    "uint16_t": 2, "int16_t": 2, "WORD": 2, "__int16": 2,
+    "int": 4, "signed int": 4, "unsigned int": 4, "signed": 4, "unsigned": 4,
+    "long": 4, "unsigned long": 4, "float": 4, "u32": 4, "s32": 4,
+    "uint32_t": 4, "int32_t": 4, "size_t": 4, "ssize_t": 4,
+    "uintptr_t": 4, "intptr_t": 4, "DWORD": 4, "__int32": 4,
+    "long long": 8, "unsigned long long": 8, "double": 8, "u64": 8, "s64": 8,
+    "uint64_t": 8, "int64_t": 8, "QWORD": 8, "__int64": 8,
+    "qword": 16, "qword_unaligned": 16,
+    "vec_uchar16": 16, "vec_char16": 16, "vec_ushort8": 16, "vec_short8": 16,
+    "vec_uint4": 16, "vec_int4": 16, "vec_ullong2": 16, "vec_llong2": 16,
+    "vec_float4": 16, "vec_double2": 16,
+}
+
+_CHAR_ESCAPES = {
+    0x00: r"\0", 0x07: r"\a", 0x08: r"\b", 0x09: r"\t",
+    0x0A: r"\n", 0x0B: r"\v", 0x0C: r"\f", 0x0D: r"\r",
+    0x27: r"\'", 0x5C: r"\\",
+}
+
+
+def _format_char_const(uval, bits=32):
+    """Format an integer constant as a big-endian C character / multi-char literal."""
+    nbytes = max(1, min(8, (bits + 7) // 8))
+    raw = [(uval >> (8 * (nbytes - 1 - i))) & 0xFF for i in range(nbytes)]
+    # Strip leading zero bytes unless this is a single-byte 0 ('\0')
+    while len(raw) > 1 and raw[0] == 0:
+        raw.pop(0)
+    parts = []
+    for b in raw:
+        if b in _CHAR_ESCAPES:
+            parts.append(_CHAR_ESCAPES[b])
+        elif 0x20 <= b <= 0x7E:
+            parts.append(chr(b))
+        else:
+            parts.append(r"\x%02X" % b)
+    return "'" + "".join(parts) + "'"
+
+
+def _strip_type_quals(type_str):
+    """Normalize a C type string by stripping leading const/volatile/struct/union."""
+    s = " ".join((type_str or "").strip().split())
+    changed = True
+    while changed:
+        changed = False
+        for kw in ("const ", "volatile ", "restrict ", "struct ", "union "):
+            if s.startswith(kw):
+                s = s[len(kw):].strip()
+                changed = True
+    return s
+
+
+def _resolve_ida_udt(type_name):
+    """Query IDA's type library for UDT (struct/union) details, or return None."""
+    try:
+        import ida_typeinf
+    except ImportError:
+        return None
+    try:
+        clean = _strip_type_quals(type_name)
+        if not clean or clean in _PRIM_SIZES or clean == "void":
+            return None
+        tif = ida_typeinf.tinfo_t()
+        ok = tif.get_named_type(None, clean)
+        if not ok:
+            ok = bool(ida_typeinf.parse_decl(tif, None, clean + ";", ida_typeinf.PT_TYP))
+        if not ok or not tif.is_udt():
+            return None
+        size = tif.get_size()
+        if size <= 0 or size == ida_typeinf.BADSIZE:
+            return None
+        udt = ida_typeinf.udt_type_data_t()
+        if not tif.get_udt_details(udt):
+            return None
+        fields = []
+        for m in udt:
+            m_off = m.offset // 8
+            m_sz = m.size // 8
+            if m_sz <= 0:
+                ms = m.type.get_size()
+                m_sz = ms if (ms and ms != ida_typeinf.BADSIZE) else 0
+            if m_sz <= 0 or not m.name:
+                continue
+            elem_sz = None
+            m_type_str = m.type.dstr()
+            if m.type.is_array():
+                etif = m.type.get_array_element()
+                es = etif.get_size()
+                if es and es != ida_typeinf.BADSIZE:
+                    elem_sz = es
+                    m_type_str = etif.dstr()
+            fields.append((m_off, m_sz, m.name, m_type_str, elem_sz))
+        return {"size": size, "fields": fields}
+    except Exception:
+        return None
+
+
+def _read_ida_cstr_relaxed(ea):
+    """Read a NUL-terminated ASCII string from IDA memory at ea (relaxed min len 1)."""
+    try:
+        import ida_bytes, ida_nalt
+        raw = ida_bytes.get_strlit_contents(ea, -1, ida_nalt.STRTYPE_C)
+        if raw:
+            txt = raw.decode("ascii", errors="replace")
+            esc = (txt.replace("\\", "\\\\").replace('"', '\\"')
+                      .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+            return '"%s"' % esc
+        # Fallback: scan loaded bytes directly for a short printable C string
+        if not ida_bytes.is_loaded(ea):
+            return None
+        buf = bytearray()
+        for off in range(256):
+            if not ida_bytes.is_loaded(ea + off):
+                return None
+            b = ida_bytes.get_byte(ea + off)
+            if b == 0:
+                break
+            if b in (0x09, 0x0A, 0x0D) or (0x20 <= b <= 0x7E):
+                buf.append(b)
+            else:
+                return None
+        if not buf:
+            return None
+        txt = buf.decode("ascii")
+        esc = (txt.replace("\\", "\\\\").replace('"', '\\"')
+                  .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+        return '"%s"' % esc
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +504,8 @@ class CGen(object):
     def __init__(self, func, name_of=None, arity_of=None, str_of=None,
                  stk_of=None, this_of=None, sym_of=None,
                  user_renames=None, user_types=None, user_proto=None,
-                 user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None):
+                 user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None,
+                 hide_casts=False, struct_resolver=None):
         self.func = func
         self.arity_of = arity_of
         self.str_of = str_of or (lambda ea: None)
@@ -378,6 +517,17 @@ class CGen(object):
         self.user_iflags = set(user_iflags or ())
         self.user_numforms = dict(user_numforms or {})
         self.user_lvars = dict(user_lvars or {})
+        self.hide_casts = bool(hide_casts)
+        self.struct_resolver = struct_resolver
+        self._type_cache = {}
+        self._cur_stmt_ea = None
+        self._cur_expr_ea = None
+        self._cur_const_idx = 0
+        self._cur_line_consts = []
+        self.body_line_consts = {}
+        self.call_eas = {}
+        self.sym_eas = {}
+        self._param_proto_types = {}
 
         if self.user_lvars:
             for loc_key, lvar_info in self.user_lvars.items():
@@ -455,6 +605,7 @@ class CGen(object):
                     p_eff_name = self.user_renames.get(p.name, p.name)
                     self.param_name[reg_num] = p_eff_name
                     pnames[(reg_num, 0)] = p_eff_name
+                    self._param_proto_types[reg_num] = p.type_str
         for r in self.params:
             if r in self.param_name:
                 continue
@@ -617,69 +768,235 @@ class CGen(object):
         return self.user_renames.get(name, name)
 
 
+    # -- constant formatting & numform overrides ---------------------------
+
+    def _reset_stmt_consts(self, primary_ea):
+        self._cur_stmt_ea = primary_ea
+        self._cur_expr_ea = primary_ea
+        self._cur_const_idx = 0
+        self._cur_line_consts = []
+
+    def _lookup_numform(self, idx):
+        if not self.user_numforms:
+            return None, self._cur_stmt_ea
+        cands = []
+        if self._cur_stmt_ea is not None:
+            cands.append((self._cur_stmt_ea, idx))
+        if self._cur_expr_ea is not None and self._cur_expr_ea != self._cur_stmt_ea:
+            cands.append((self._cur_expr_ea, 0))
+        if idx == 0 and self._current_inlined_eas:
+            for iea in self._current_inlined_eas:
+                cands.append((iea, 0))
+        for ea, i in cands:
+            for k in (f"{hex(ea)}:{i}", f"{ea}:{i}"):
+                form = self.user_numforms.get(k)
+                if form:
+                    return form, self._cur_stmt_ea if self._cur_stmt_ea is not None else ea
+        return None, self._cur_stmt_ea
+
+    def _record_const(self, idx, ea, uval, bits, text, default_form,
+                      applied_form=None, is_addr=False, addr_val=None):
+        eff_ea = ea if ea is not None else self._cur_stmt_ea
+        self._cur_line_consts.append({
+            "idx": idx,
+            "ea": eff_ea,
+            "val": uval,
+            "bits": bits,
+            "text": text,
+            "default_form": default_form,
+            "form": applied_form or default_form,
+            "applied": applied_form is not None,
+            "is_addr": is_addr,
+            "addr_val": addr_val if addr_val is not None else uval,
+        })
+        return text
+
+    def _apply_numform(self, uval, bits, form, addr_val=None, is_addr=False):
+        mask = (1 << bits) - 1 if bits > 0 else 0xFFFFFFFF
+        uv = uval & mask
+        sv = uv - (1 << bits) if (bits > 0 and uv >= (1 << (bits - 1))) else uv
+        av = addr_val if addr_val is not None else uv
+        fl = form.lower()
+
+        if fl.startswith("enum:"):
+            ename = form.split(":", 1)[1].strip()
+            return ename if ename else ("0x%X" % uv)
+        if fl == "hex" or fl == "uhex":
+            return "0x%X" % uv
+        if fl == "shex":
+            return ("-0x%X" % (-sv)) if sv < 0 else ("0x%X" % uv)
+        if fl == "dec":
+            if sv < 0 and (-sv) <= 0xFFFF and bits >= 16:
+                return "%d" % sv
+            return "%d" % uv
+        if fl == "udec":
+            return "%d" % uv
+        if fl == "sdec" or fl == "signed":
+            return "%d" % sv
+        if fl == "char":
+            return _format_char_const(uv, bits)
+        if fl == "bin":
+            return "0b" + format(uv, "b")
+        if fl == "oct":
+            return "0%o" % uv if uv != 0 else "0"
+        if fl == "inv":
+            return "~0x%X" % ((~uv) & mask)
+        if fl == "str":
+            lit = self.str_of(av)
+            if lit is not None:
+                return lit
+            lit2 = _read_ida_cstr_relaxed(av)
+            if lit2 is not None:
+                return lit2
+            return _format_char_const(uv, bits)
+        if fl == "nostr":
+            return "0x%X" % av if is_addr else ("0x%X" % uv)
+        if fl == "offset":
+            sym = self.sym_of(av)
+            if sym is not None:
+                if " + " in sym:
+                    base, off = sym.split(" + ", 1)
+                    eff_base = self.user_renames.get(base, base)
+                    self.sym_eas[eff_base] = av
+                    return "&" + eff_base + " + " + off
+                eff_sym = self.user_renames.get(sym, sym)
+                self.sym_eas[eff_sym] = av
+                return "&" + eff_sym
+            fn_nm = self.name_of(av) if self.name_of else None
+            if fn_nm:
+                self.sym_eas[fn_nm] = av
+                return "&" + fn_nm
+            return "&unk_%X" % av
+        return "0x%X" % uv
+
+    def _fmt_imm(self, val, bits=32, default_form="dec"):
+        """Format an inline integer immediate (e.g. shift/rotate count) with numform support."""
+        idx = self._cur_const_idx
+        self._cur_const_idx += 1
+        mask = (1 << bits) - 1
+        uval = val & mask
+        form, form_ea = self._lookup_numform(idx)
+        if form:
+            txt = self._apply_numform(uval, bits, form, addr_val=uval, is_addr=False)
+            return self._record_const(idx, form_ea, uval, bits, txt, default_form, applied_form=form)
+        txt = ("%d" % val) if default_form == "dec" else ("0x%X" % uval)
+        return self._record_const(idx, self._cur_stmt_ea, uval, bits, txt, default_form)
+
+    def _cast(self, type_str, expr):
+        """Apply a C scalar cast unless hide_casts is active."""
+        if self.hide_casts:
+            return expr
+        return "(%s)%s" % (type_str, expr)
+
     def const(self, c, scalar, strings=True, ew=None):
         """
-        A constant, as a string literal when its preferred slot points at one.
+        A constant, as a string literal when its preferred slot points at one,
+        or formatted according to any user numform override.
 
         ``strings=False`` is for a position where a literal would be actively
         misleading rather than helpful -- the destination of a store, where
         `*(char *)"text" = x` reads as writing to a string constant when the
         code is really writing into a buffer that currently holds text.
         """
+        idx = self._cur_const_idx
+        self._cur_const_idx += 1
+        addr_val = c.val >> 96
+
+        # Determine natural bit-width and scalar value of this constant
+        eff_ew = ew or getattr(c, "ew", None)
+        bits = 32
+        uval = addr_val
+        replicated_cand = None
+        if c.val == 0:
+            bits = (int(eff_ew) * 8) if eff_ew in (EW.B, EW.H, EW.W, EW.D) else 32
+            uval = 0
+        elif c.val == (1 << 128) - 1:
+            bits = (int(eff_ew) * 8) if eff_ew in (EW.B, EW.H, EW.W, EW.D) else 32
+            uval = (1 << bits) - 1
+        else:
+            cands = [eff_ew] if eff_ew is not None and eff_ew != EW.Q else []
+            for cand in (EW.B, EW.H, EW.W, EW.D):
+                if cand not in cands:
+                    cands.append(cand)
+            for cand in cands:
+                cbits = int(cand) * 8
+                n = 16 // int(cand)
+                lane = c.val >> (128 - cbits)
+                if all(((c.val >> (128 - cbits * (i + 1))) & ((1 << cbits) - 1)) == lane
+                       for i in range(n)):
+                    replicated_cand = (cand, cbits, lane)
+                    bits = cbits
+                    uval = lane
+                    break
+            if replicated_cand is None and not scalar and (c.val & ((1 << 96) - 1)) != 0:
+                bits = 128
+                uval = c.val
+
+        form, form_ea = self._lookup_numform(idx)
+        if form:
+            is_addr_hint = (form.lower() in ("str", "nostr", "offset"))
+            txt = self._apply_numform(uval, bits, form, addr_val=addr_val, is_addr=is_addr_hint)
+            return self._record_const(idx, form_ea, uval, bits, txt, "hex",
+                                      applied_form=form, is_addr=is_addr_hint, addr_val=addr_val)
+
         if strings:
-            lit = self.str_of(c.val >> 96)
+            lit = self.str_of(addr_val)
             if lit is not None:
-                return lit
-        sym = self.sym_of(c.val >> 96)
+                return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, lit,
+                                          "str", is_addr=True, addr_val=addr_val)
+        sym = self.sym_of(addr_val)
         if sym is not None:
             if " + " in sym:
                 base, off = sym.split(" + ", 1)
                 eff_base = self.user_renames.get(base, base)
-                return "&" + eff_base + " + " + off
-            eff_sym = self.user_renames.get(sym, sym)
-            return "&" + eff_sym
+                self.sym_eas[eff_base] = addr_val
+                txt = "&" + eff_base + " + " + off
+            else:
+                eff_sym = self.user_renames.get(sym, sym)
+                self.sym_eas[eff_sym] = addr_val
+                txt = "&" + eff_sym
+            return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, txt,
+                                      "offset", is_addr=True, addr_val=addr_val)
         if c.val == 0:
-            return "0"
+            return self._record_const(idx, self._cur_stmt_ea, 0, bits, "0",
+                                      "dec", addr_val=0)
 
-        eff_ew = ew or getattr(c, "ew", None)
         if c.val == (1 << 128) - 1:
             if eff_ew == EW.B:
-                return "0xFF"
-            elif eff_ew in (EW.H, EW.W, EW.D):
-                return "-0x1"
-            else:
-                return "-0x1"
+                return self._record_const(idx, self._cur_stmt_ea, 0xFF, 8, "0xFF", "hex")
+            return self._record_const(idx, self._cur_stmt_ea, uval, bits, "-0x1", "shex")
 
-        cands = [eff_ew] if eff_ew is not None and eff_ew != EW.Q else []
-        for cand in (EW.B, EW.H, EW.W, EW.D):
-            if cand not in cands:
-                cands.append(cand)
+        if replicated_cand is not None:
+            cand, cbits, lane = replicated_cand
+            if cand == EW.W:
+                if lane >= 0x80000000 and (0x100000000 - lane) <= 0xFFFF:
+                    return self._record_const(idx, self._cur_stmt_ea, lane, 32,
+                                              "-0x%X" % (0x100000000 - lane), "shex", addr_val=addr_val)
+                return self._record_const(idx, self._cur_stmt_ea, lane, 32,
+                                          "0x%X" % lane, "hex", addr_val=addr_val)
+            elif cand == EW.D:
+                if lane >= 0x8000000000000000 and (0x10000000000000000 - lane) <= 0xFFFF:
+                    return self._record_const(idx, self._cur_stmt_ea, lane, 64,
+                                              "-0x%X" % (0x10000000000000000 - lane), "shex", addr_val=addr_val)
+                return self._record_const(idx, self._cur_stmt_ea, lane, 64,
+                                          "0x%X" % lane, "hex", addr_val=addr_val)
+            elif cand == EW.H:
+                if lane >= 0x8000 and (0x10000 - lane) <= 0xFF:
+                    return self._record_const(idx, self._cur_stmt_ea, lane, 16,
+                                              "-0x%X" % (0x10000 - lane), "shex", addr_val=addr_val)
+                return self._record_const(idx, self._cur_stmt_ea, lane, 16,
+                                          "0x%X" % lane, "hex", addr_val=addr_val)
+            else:  # EW.B
+                return self._record_const(idx, self._cur_stmt_ea, lane, 8,
+                                          "0x%X" % lane, "hex", addr_val=addr_val)
 
-        for cand in cands:
-            bits = int(cand) * 8
-            n = 16 // int(cand)
-            lane = c.val >> (128 - bits)
-            if all(((c.val >> (128 - bits * (i + 1))) & ((1 << bits) - 1)) == lane
-                   for i in range(n)):
-                if cand == EW.W:
-                    if lane >= 0x80000000 and (0x100000000 - lane) <= 0xFFFF:
-                        return "-0x%X" % (0x100000000 - lane)
-                    return "0x%X" % lane
-                elif cand == EW.D:
-                    if lane >= 0x8000000000000000 and (0x10000000000000000 - lane) <= 0xFFFF:
-                        return "-0x%X" % (0x10000000000000000 - lane)
-                    return "0x%X" % lane
-                elif cand == EW.H:
-                    if lane >= 0x8000 and (0x10000 - lane) <= 0xFF:
-                        return "-0x%X" % (0x10000 - lane)
-                    return "0x%X" % lane
-                else:  # EW.B
-                    return "0x%X" % lane
-        if scalar:
-            return c.scalar_str()
-        if (c.val & ((1 << 96) - 1)) == 0:
-            return c.scalar_str()
-        return "0x%032X" % c.val
+        if scalar or (c.val & ((1 << 96) - 1)) == 0:
+            txt = c.scalar_str()
+            df = "shex" if txt.startswith("-0x") else ("hex" if txt.startswith("0x") else "dec")
+            return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, txt,
+                                      df, addr_val=addr_val)
+        txt = "0x%032X" % c.val
+        return self._record_const(idx, self._cur_stmt_ea, c.val, 128, txt, "hex", addr_val=addr_val)
 
     def operand(self, v, depth=0, scalar=True, top=False, want_scalar=False,
                 strings=True, ew=None):
@@ -699,8 +1016,14 @@ class CGen(object):
             def_insn = self.defs[v.key()]
             if getattr(def_insn, "ea", None) is not None:
                 self._current_inlined_eas.append(def_insn.ea)
-            return self.rhs(def_insn, depth + 1, top=top,
-                            want_scalar=want_scalar, strings=strings)
+            prev_expr_ea = self._cur_expr_ea
+            if getattr(def_insn, "ea", None) is not None:
+                self._cur_expr_ea = def_insn.ea
+            try:
+                return self.rhs(def_insn, depth + 1, top=top,
+                                want_scalar=want_scalar, strings=strings)
+            finally:
+                self._cur_expr_ea = prev_expr_ea
         return self.nm(v)
 
     def _stack_indexed_addr(self, v, depth=0):
@@ -760,19 +1083,35 @@ class CGen(object):
         if stk_idx is not None:
             return stk_idx
         if v.is_const:
+            idx = self._cur_const_idx
+            self._cur_const_idx += 1
+            addr_val = v.val >> 96
+            form, form_ea = self._lookup_numform(idx)
+            if form:
+                txt = self._apply_numform(addr_val, 32, form, addr_val=addr_val, is_addr=True)
+                return self._record_const(idx, form_ea, addr_val, 32, txt, "hex",
+                                          applied_form=form, is_addr=True, addr_val=addr_val)
             if strings:
-                lit = self.str_of(v.val >> 96)
+                lit = self.str_of(addr_val)
                 if lit is not None:
-                    return lit
-            sym = self.sym_of(v.val >> 96)
+                    return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, lit,
+                                              "str", is_addr=True, addr_val=addr_val)
+            sym = self.sym_of(addr_val)
             if sym is not None:
                 if " + " in sym:
                     base, off = sym.split(" + ", 1)
                     eff_base = self.user_renames.get(base, base)
-                    return "&" + eff_base + " + " + off
-                eff_sym = self.user_renames.get(sym, sym)
-                return "&" + eff_sym
-            return "0x%X" % (v.val >> 96)
+                    self.sym_eas[eff_base] = addr_val
+                    txt = "&" + eff_base + " + " + off
+                else:
+                    eff_sym = self.user_renames.get(sym, sym)
+                    self.sym_eas[eff_sym] = addr_val
+                    txt = "&" + eff_sym
+                return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, txt,
+                                          "offset", is_addr=True, addr_val=addr_val)
+            txt = "0x%X" % addr_val
+            return self._record_const(idx, self._cur_stmt_ea, addr_val, 32, txt,
+                                      "hex", is_addr=True, addr_val=addr_val)
         return self.operand(v, depth, top=True, want_scalar=True,
                             strings=strings)
 
@@ -830,6 +1169,9 @@ class CGen(object):
             if op in (Op.CALL, Op.TCALL):
                 raw_tgt = self.name_of(insn.aux)
                 tgt = self.user_renames.get(raw_tgt, raw_tgt)
+                if insn.aux is not None:
+                    self.call_eas[tgt] = insn.aux
+                    self.call_eas[raw_tgt] = insn.aux
             else:
                 tgt = "(*%s)" % self.operand(insn.srcs[0], depth)
             args = self.call_args.get(id(insn))
@@ -961,16 +1303,16 @@ class CGen(object):
                         inner_d = self.defs[inner_op.key()]
                         if inner_d.op in (Op.CMPEQ, Op.CMPGT, Op.CMPGTU, Op.FCMPEQ, Op.FCMPGT):
                             return self.operand(inner_op, depth, sc)
-                    return "(char)%s" % self.operand(inner_op, depth, sc)
+                    return self._cast("char", self.operand(inner_op, depth, sc))
             arg = self.operand(insn.srcs[0], depth, sc)
             if not arg.isidentifier() and not (arg.startswith("(") and arg.endswith(")")):
                 arg = "(%s)" % arg
             if insn.ew == EW.H:
-                return "(short)(char)%s" % arg
+                return self._cast("short", self._cast("char", arg))
             if insn.ew == EW.W:
-                return "(int)(short)%s" % arg
+                return self._cast("int", self._cast("short", arg))
             if insn.ew == EW.D:
-                return "(long long)(int)%s" % arg
+                return self._cast("long long", self._cast("int", arg))
 
         if op == Op.SELB and len(insn.srcs) == 3:
             rc_var = insn.srcs[2]
@@ -1044,21 +1386,21 @@ class CGen(object):
                     if cnt == 4:
                         if not val_str.isidentifier() and not (val_str.startswith("(") and val_str.endswith(")")):
                             val_str = "(%s)" % val_str
-                        return "(u32)%s" % val_str
+                        return self._cast("u32", val_str)
                     else:
                         bits = cnt * 8
-                        text = "%s << %d" % (val_str, bits)
+                        text = "%s << %s" % (val_str, self._fmt_imm(bits))
                         return text if top else "(%s)" % text
                 elif op == Op.QROTMBY:
                     k = (-cnt) & 0x1F
                     bits = k * 8
-                    text = "%s >> %d" % (val_str, bits)
+                    text = "%s >> %s" % (val_str, self._fmt_imm(bits))
                     return text if top else "(%s)" % text
                 elif op == Op.QSHLBI:
-                    text = "%s << %d" % (val_str, cnt)
+                    text = "%s << %s" % (val_str, self._fmt_imm(cnt))
                     return text if top else "(%s)" % text
                 elif op == Op.QROTMBI:
-                    text = "%s >> %d" % (val_str, cnt)
+                    text = "%s >> %s" % (val_str, self._fmt_imm(cnt))
                     return text if top else "(%s)" % text
             else:
                 cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
@@ -1268,33 +1610,34 @@ class CGen(object):
                 k = cnt_val if cnt_val < 0x80000000 else cnt_val - 0x100000000
                 if k <= 0:
                     shift = (-k) & 31
+                    s_txt = self._fmt_imm(shift)
                     if op == Op.ROTMA:
-                        text = "(int)%s >> %d" % (val, shift)
+                        text = "%s >> %s" % (self._cast("int", val), s_txt)
                     else:
-                        text = "%s >> %d" % (val, shift)
+                        text = "%s >> %s" % (val, s_txt)
                 else:
-                    text = "_rotl(%s, %d)" % (val, k & 31)
+                    text = "_rotl(%s, %s)" % (val, self._fmt_imm(k & 31))
                 return text if top else "(%s)" % text
             else:
                 cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
                 if cnt_str.startswith("(0 - ") and cnt_str.endswith(")"):
                     inner = cnt_str[5:-1].strip()
                     if op == Op.ROTMA:
-                        text = "(int)%s >> %s" % (val, inner)
+                        text = "%s >> %s" % (self._cast("int", val), inner)
                     else:
                         text = "%s >> %s" % (val, inner)
                     return text if top else "(%s)" % text
                 elif cnt_str.startswith("-"):
                     inner = cnt_str[1:].strip()
                     if op == Op.ROTMA:
-                        text = "(int)%s >> %s" % (val, inner)
+                        text = "%s >> %s" % (self._cast("int", val), inner)
                     else:
                         text = "%s >> %s" % (val, inner)
                     return text if top else "(%s)" % text
                 if op == Op.ROL:
                     text = "_rotl(%s, %s)" % (val, cnt_str)
                 elif op == Op.ROTMA:
-                    text = "(int)%s >> %s" % (val, cnt_str)
+                    text = "%s >> %s" % (self._cast("int", val), cnt_str)
                 else:
                     text = "%s >> %s" % (val, cnt_str)
                 return text if top else "(%s)" % text
@@ -1303,7 +1646,7 @@ class CGen(object):
             val = self.operand(insn.srcs[0], depth, sc, want_scalar=False)
             if insn.srcs[1].is_const:
                 cnt = (insn.srcs[1].val >> 96) & 0x7F
-                text = "_rotl(%s, %d)" % (val, cnt)
+                text = "_rotl(%s, %s)" % (val, self._fmt_imm(cnt))
             else:
                 cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
                 text = "_rotl(%s, %s)" % (val, cnt_str)
@@ -1314,7 +1657,7 @@ class CGen(object):
             if insn.srcs[1].is_const:
                 cnt = (insn.srcs[1].val >> 96) & 0xF
                 bits = cnt * 8
-                text = "_rotl(%s, %d)" % (val, bits)
+                text = "_rotl(%s, %s)" % (val, self._fmt_imm(bits))
             else:
                 cnt_str = self.operand(insn.srcs[1], depth, True, want_scalar=True)
                 text = "_rotl(%s, (%s) * 8)" % (val, cnt_str)
@@ -1323,25 +1666,25 @@ class CGen(object):
         if op == Op.MPYH and len(insn.srcs) == 2:
             a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
             b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
-            text = "((u32)(%s >> 16) * (u16)%s) << 16" % (a, b)
+            text = "(%s * %s) << 16" % (self._cast("u32", "(%s >> 16)" % a), self._cast("u16", b))
             return text if top else "(%s)" % text
 
         if op == Op.MPYHHU and len(insn.srcs) == 2:
             a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
             b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
-            text = "((u32)%s >> 16) * ((u32)%s >> 16)" % (a, b)
+            text = "(%s >> 16) * (%s >> 16)" % (self._cast("u32", a), self._cast("u32", b))
             return text if top else "(%s)" % text
 
         if op == Op.MPYHH and len(insn.srcs) == 2:
             a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
             b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
-            text = "((int)%s >> 16) * ((int)%s >> 16)" % (a, b)
+            text = "(%s >> 16) * (%s >> 16)" % (self._cast("int", a), self._cast("int", b))
             return text if top else "(%s)" % text
 
         if op == Op.MPYU and len(insn.srcs) == 2:
             a = self.operand(insn.srcs[0], depth, True, want_scalar=True)
             b = self.operand(insn.srcs[1], depth, True, want_scalar=True)
-            text = "(u16)%s * (u16)%s" % (a, b)
+            text = "%s * %s" % (self._cast("u16", a), self._cast("u16", b))
             return text if top else "(%s)" % text
 
         if op in (Op.MPY, Op.MUL) and len(insn.srcs) == 2:
@@ -1350,17 +1693,18 @@ class CGen(object):
             if op == Op.MUL or insn.ew == EW.W:
                 text = "%s * %s" % (a, b)
             else:
-                text = "(short)%s * (short)%s" % (a, b)
+                text = "%s * %s" % (self._cast("short", a), self._cast("short", b))
             return text if top else "(%s)" % text
 
         if insn.ew == EW.H and op in (Op.ADD, Op.SUB, Op.SHL, Op.SHR, Op.SAR) and len(insn.srcs) == 2:
             a = self.operand(insn.srcs[0], depth, True, want_scalar=True, ew=insn.ew)
             b = self.operand(insn.srcs[1], depth, True, want_scalar=True, ew=insn.ew)
             sym = {Op.ADD: "+", Op.SUB: "-", Op.SHL: "<<", Op.SHR: ">>", Op.SAR: ">>"}[op]
-            cast = "(short)" if op == Op.SAR else "(u16)"
+            cast_t = "short" if op == Op.SAR else "u16"
             if op == Op.ADD and insn.srcs[1].is_const and b.startswith("-"):
                 sym, b = "-", b[1:]
-            text = "%s(%s %s %s)" % (cast, a, sym, b)
+            inner = "(%s %s %s)" % (a, sym, b)
+            text = self._cast(cast_t, inner)
             return text if top else "(%s)" % text
 
         if op == Op.GENCTL and len(insn.srcs) >= 1:
@@ -1398,6 +1742,8 @@ class CGen(object):
         printed expression equal to the machine's.  An operand already
         rendered as a byte cast, or already pointing at bytes, is left alone.
         """
+        if self.hide_casts:
+            return text
         t = self.type_of(v)
         if t is None or t.kind != types.PTR:
             return text
@@ -1613,19 +1959,202 @@ class CGen(object):
             return "&" + eff_hit
         return "(char *)&%s + %d" % (eff_hit, byte_off)
 
+    def _get_udt(self, type_name):
+        """Look up UDT (struct/union) info via struct_resolver or IDA type library."""
+        key = _strip_type_quals(type_name)
+        if not key or key in _PRIM_SIZES or key == "void":
+            return None
+        if key in self._type_cache:
+            return self._type_cache[key]
+        info = None
+        if self.struct_resolver is not None:
+            try:
+                info = self.struct_resolver(key)
+            except Exception:
+                info = None
+        if info is None:
+            info = _resolve_ida_udt(key)
+        self._type_cache[key] = info
+        return info
+
+    def _resolve_field_path(self, type_name, byte_off, access_size, depth=0):
+        """Resolve a byte offset inside a UDT to (field_path, matched_size, rem)."""
+        if depth > 4 or byte_off < 0:
+            return None
+        udt = self._get_udt(type_name)
+        if not udt:
+            return None
+        for m_off, m_sz, m_name, m_type, m_elem_sz in udt.get("fields", ()):
+            if m_off <= byte_off < m_off + m_sz:
+                rem = byte_off - m_off
+                if m_elem_sz and m_elem_sz > 0:
+                    arr_idx = rem // m_elem_sz
+                    sub_rem = rem % m_elem_sz
+                    if sub_rem == 0 and m_elem_sz == access_size:
+                        return ("%s[%d]" % (m_name, arr_idx), access_size, 0)
+                    sub = self._resolve_field_path(m_type, sub_rem, access_size, depth + 1)
+                    if sub is not None:
+                        return ("%s[%d].%s" % (m_name, arr_idx, sub[0]), sub[1], sub[2])
+                    return ("%s[%d]" % (m_name, arr_idx), m_elem_sz, sub_rem)
+                if rem == 0 and m_sz == access_size:
+                    return (m_name, m_sz, 0)
+                sub = self._resolve_field_path(m_type, rem, access_size, depth + 1)
+                if sub is not None:
+                    return ("%s.%s" % (m_name, sub[0]), sub[1], sub[2])
+                return (m_name, m_sz, rem)
+        return None
+
+    def _user_type_of_var(self, base_key):
+        """Return user/prototype type string for variable (reg, ver), or None."""
+        reg, ver = base_key
+        v = Var(reg, ver)
+        raw_nm = self.namer.name(v)
+        eff_nm = self.user_renames.get(raw_nm, raw_nm)
+        ut = self.user_types.get(raw_nm) or self.user_types.get(eff_nm)
+        if ut:
+            return ut
+        if ver == 0:
+            if reg in self._param_proto_types:
+                return self._param_proto_types[reg]
+            if reg == self.this_reg and self.member_class:
+                return "%s *" % self.member_class
+        return None
+
+    def _format_member_access(self, base_expr, op_str, field_res, access_ctype, access_size):
+        """Format `base->field` / `base.field`, falling back to partial cast if width differs."""
+        fpath, fsz, rem = field_res
+        expr = "%s%s%s" % (base_expr, op_str, fpath)
+        if rem == 0 and fsz == access_size:
+            return expr
+        if rem == 0:
+            return "*(%s *)&%s" % (access_ctype, expr)
+        if self.hide_casts:
+            return "*(%s *)(&%s + 0x%X)" % (access_ctype, expr, rem)
+        return "*(%s *)((char *)&%s + 0x%X)" % (access_ctype, expr, rem)
+
+    def _resolve_typed_deref(self, insn, depth=0):
+        """Resolve a load/store through a user-typed pointer into `p->field` or `p[i]`."""
+        from .scalarize import addr_expr, word0
+        addr = insn.srcs[1]
+        access_size = int(insn.ew)
+        access_ctype = self._access_type(insn)
+
+        # 1. Constant-offset address `base + byte_off`
+        base_key, byte_off, _ = addr_expr(addr, self.defs)
+        if base_key is not None and base_key != (regs.SP, 0):
+            utype = self._user_type_of_var(base_key)
+            if utype and "*" in utype:
+                # Single-level pointer (`T *`) -> strip one trailing `*`
+                stripped = utype.strip()
+                if stripped.endswith("*"):
+                    pointee_str = stripped[:-1].strip()
+                    pointee_clean = _strip_type_quals(pointee_str)
+                    if pointee_clean and pointee_clean != "void" and "*" not in pointee_clean:
+                        signed_off = frame.signed_offset(byte_off)
+                        if 0 <= signed_off < 0x100000:
+                            base_var = Var(base_key[0], base_key[1])
+                            udt = self._get_udt(pointee_clean)
+                            if udt is not None:
+                                sz = udt["size"]
+                                if signed_off < sz:
+                                    res = self._resolve_field_path(pointee_clean, signed_off, access_size)
+                                    if res is not None:
+                                        bname = self.nm(base_var)
+                                        return self._format_member_access(bname, "->", res, access_ctype, access_size)
+                                elif sz > 0:
+                                    arr_idx = signed_off // sz
+                                    rem = signed_off % sz
+                                    res = self._resolve_field_path(pointee_clean, rem, access_size)
+                                    if res is not None:
+                                        bname = self.nm(base_var)
+                                        return self._format_member_access("%s[%d]" % (bname, arr_idx), ".", res, access_ctype, access_size)
+                            prim_sz = _PRIM_SIZES.get(pointee_clean)
+                            if prim_sz is not None and prim_sz == access_size and (signed_off % prim_sz) == 0:
+                                bname = self.nm(base_var)
+                                if signed_off == 0:
+                                    return "*%s" % bname
+                                return "%s[%d]" % (bname, signed_off // prim_sz)
+
+        # 2. Dynamic indexed address `base + idx` or `base + (idx << k)` / `base + idx * elem_sz`
+        cur = addr
+        if cur.is_var and cur.key() in self.defs:
+            d = self.defs[cur.key()]
+            if d.op == Op.ADD and d.ew == EW.W and len(d.srcs) == 2:
+                s1, s2 = d.srcs
+                for base_op, idx_op in ((s1, s2), (s2, s1)):
+                    if not base_op.is_var:
+                        continue
+                    bkey = base_op.key()
+                    if bkey == (regs.SP, 0):
+                        continue
+                    utype = self._user_type_of_var(bkey)
+                    if not utype or not utype.strip().endswith("*"):
+                        continue
+                    pointee_clean = _strip_type_quals(utype.strip()[:-1].strip())
+                    if not pointee_clean or pointee_clean == "void" or "*" in pointee_clean:
+                        continue
+                    prim_sz = _PRIM_SIZES.get(pointee_clean)
+                    if prim_sz is None or prim_sz != access_size:
+                        continue
+                    if prim_sz == 1:
+                        bname = self.nm(base_op)
+                        idx_s = self.operand(idx_op, depth, True, want_scalar=True)
+                        return "%s[%s]" % (bname, idx_s)
+                    # Check scaled index: (idx << shift) or (idx * prim_sz)
+                    if idx_op.is_var and idx_op.key() in self.defs:
+                        id_def = self.defs[idx_op.key()]
+                        if id_def.op == Op.SHL and len(id_def.srcs) == 2 and id_def.srcs[1].is_const:
+                            sh = word0(id_def.srcs[1].val)
+                            if (1 << sh) == prim_sz:
+                                bname = self.nm(base_op)
+                                idx_s = self.operand(id_def.srcs[0], depth, True, want_scalar=True)
+                                return "%s[%s]" % (bname, idx_s)
+                        if id_def.op in (Op.MUL, Op.MPY) and len(id_def.srcs) == 2 and id_def.srcs[1].is_const:
+                            if word0(id_def.srcs[1].val) == prim_sz:
+                                bname = self.nm(base_op)
+                                idx_s = self.operand(id_def.srcs[0], depth, True, want_scalar=True)
+                                return "%s[%s]" % (bname, idx_s)
+        return None
+
     def _stack_name(self, insn):
         """
         How this access prints as a named slot: the name, or None.
 
         A narrower access than the slot's own width takes the address of the
-        slot and casts, which keeps one name for one location.
+        slot and casts, which keeps one name for one location. If the user
+        typed a stack variable as a struct or array, resolves `var.field` / `var[i]`.
         """
         if self._slots is None:
             self._slots = self._slot_types()
         if not self._slots or len(insn.srcs) < 2:
             return None
-        from .scalarize import addr_expr, word0
+        from .scalarize import addr_expr
         base, off, _ = addr_expr(insn.srcs[1], self.defs)
+        signed_off = frame.signed_offset(off)
+        access_size = int(insn.ew)
+        t = self._access_type(insn)
+
+        # Check if this offset falls inside a user-typed multi-slot stack struct/array
+        if base == (regs.SP, 0) and self.user_types:
+            for (sb, soff), (sname, sct, sew) in self._slots.items():
+                if sb != base:
+                    continue
+                eff_sname = self.user_renames.get(sname, sname)
+                ut = self.user_types.get(sname) or self.user_types.get(eff_sname)
+                if not ut or "*" in ut:
+                    continue
+                s_signed = frame.signed_offset(soff)
+                rel = signed_off - s_signed
+                if rel < 0:
+                    continue
+                clean_ut = _strip_type_quals(ut)
+                udt = self._get_udt(clean_ut)
+                if udt is not None and rel < udt["size"]:
+                    res = self._resolve_field_path(clean_ut, rel, access_size)
+                    if res is not None:
+                        self.stack_decls[sname] = sct
+                        return self._format_member_access(eff_sname, ".", res, t, access_size)
+
         slot_base = off & ~0xF
         byte_off = off & 0xF
         hit = self._slots.get((base, slot_base))
@@ -1637,7 +2166,17 @@ class CGen(object):
         name, ct, ew = hit
         self.stack_decls[name] = ct
         eff_name = self.user_renames.get(name, name)
-        t = self._access_type(insn)
+
+        # Check user struct/array type on this exact stack slot
+        ut = self.user_types.get(name) or self.user_types.get(eff_name)
+        if ut and "*" not in ut:
+            clean_ut = _strip_type_quals(ut)
+            udt = self._get_udt(clean_ut)
+            if udt is not None and byte_off < udt["size"]:
+                res = self._resolve_field_path(clean_ut, byte_off, access_size)
+                if res is not None:
+                    return self._format_member_access(eff_name, ".", res, t, access_size)
+
         if byte_off == 0:
             if insn.ew == ew:
                 return eff_name
@@ -1647,9 +2186,9 @@ class CGen(object):
 
     def _deref(self, insn, depth=0):
         """
-        `*p` when the address is a pointer of the right shape, `*(T *)(e)`
-        otherwise.  The cast is not decoration -- it is the only thing saying
-        how wide the access is when the pointer type is not known.
+        `*p` when the address is a pointer of the right shape, `p->field` or
+        `p[i]` when user/prototype types provide struct or element info, and
+        `*(T *)(e)` otherwise.
         """
         addr = insn.srcs[1]
         t = self._access_type(insn)
@@ -1658,6 +2197,10 @@ class CGen(object):
         slot = self._stack_name(insn)
         if slot is not None:
             return slot
+        # User / prototype typed struct pointer or array pointer access
+        typed = self._resolve_typed_deref(insn, depth)
+        if typed is not None:
+            return typed
         pt = self.type_of(addr)
         if (pt is not None and pt.kind == types.PTR and addr.is_var
                 and addr.key() not in self.inlinable
@@ -2228,6 +2771,37 @@ class CGen(object):
         unique_eas = list(dict.fromkeys(e for e in all_eas if e is not None))
         self.body_line_to_eas[lineno] = unique_eas
 
+        if self._cur_line_consts:
+            # Locate each constant's character span on the final rendered line
+            search_pos = 0
+            resolved = []
+            for cinfo in self._cur_line_consts:
+                ctext = cinfo["text"]
+                pos = text.find(ctext, search_pos)
+                matched_len = len(ctext)
+                if pos < 0 and ctext.startswith("-"):
+                    # Op.ADD rewrites `a + -0x4` -> `a - 0x4`
+                    stripped = ctext[1:]
+                    pos = text.find(stripped, search_pos)
+                    matched_len = len(stripped)
+                if pos < 0:
+                    pos = text.find(ctext)
+                    matched_len = len(ctext)
+                entry = dict(cinfo)
+                if entry.get("ea") is None and unique_eas:
+                    entry["ea"] = unique_eas[0]
+                if pos >= 0:
+                    entry["col_start"] = pos
+                    entry["col_end"] = pos + matched_len
+                    search_pos = pos + matched_len
+                else:
+                    entry["col_start"] = 0
+                    entry["col_end"] = len(text)
+                resolved.append(entry)
+            self.body_line_consts[lineno] = resolved
+            self._cur_line_consts = []
+            self._cur_const_idx = 0
+
     @staticmethod
     def _invert_cond_str(cond_str):
         c = cond_str.strip()
@@ -2255,14 +2829,18 @@ class CGen(object):
             if isinstance(st, Basic):
                 for insn in st.insns:
                     self._current_inlined_eas = []
+                    self._reset_stmt_consts(insn.ea)
                     text = self.insn_stmt(insn)
                     if text:
                         self._add_line(out, pad + text, primary_ea=insn.ea,
                                        inlined_eas=self._current_inlined_eas)
+                    else:
+                        self._cur_line_consts = []
             elif isinstance(st, If):
                 self._current_inlined_eas = []
-                cond_str = self._cond(st.cond)
                 ea = getattr(st, "ea", None)
+                self._reset_stmt_consts(ea)
+                cond_str = self._cond(st.cond)
                 invert = False
                 if ea is not None and getattr(self, "user_iflags", None):
                     invert = (ea in self.user_iflags or
@@ -2294,6 +2872,7 @@ class CGen(object):
                 hdr_ea = getattr(st.header, "start_ea", None) if getattr(st, "header", None) else None
                 if st.kind == "while":
                     self._current_inlined_eas = []
+                    self._reset_stmt_consts(hdr_ea)
                     cond_str = self._cond(st.cond)
                     self._add_line(out, "%swhile ( %s )" % (pad, cond_str),
                                    primary_ea=hdr_ea, inlined_eas=self._current_inlined_eas)
@@ -2305,6 +2884,7 @@ class CGen(object):
                     self._add_line(out, pad + "{", primary_ea=None)
                     self.emit(st.body, out, indent + 1, info)
                     self._current_inlined_eas = []
+                    self._reset_stmt_consts(hdr_ea)
                     cond_str = self._cond(st.cond)
                     self._add_line(out, "%s} while ( %s );" % (pad, cond_str),
                                    primary_ea=hdr_ea, inlined_eas=self._current_inlined_eas)
@@ -2328,12 +2908,15 @@ class CGen(object):
                                                    _lbl(st.block)), primary_ea=st.block.start_ea)
             elif isinstance(st, Return):
                 self._current_inlined_eas = []
+                ea = getattr(st.insn, "ea", None)
+                self._reset_stmt_consts(ea)
                 ret_str = self._return(st.insn)
-                self._add_line(out, pad + ret_str, primary_ea=getattr(st.insn, "ea", None),
+                self._add_line(out, pad + ret_str, primary_ea=ea,
                                inlined_eas=self._current_inlined_eas)
             elif isinstance(st, Tail):
                 self._current_inlined_eas = []
                 ea = getattr(st.insn, "ea", None)
+                self._reset_stmt_consts(ea)
                 if st.insn.op == Op.IJMP:
                     blk = st.insn.block
                     kind = ("jump table" if blk is not None
@@ -2353,6 +2936,8 @@ class CGen(object):
                         target_name = "loc_%X" % st.insn.aux
                     else:
                         target_name = self.user_renames.get(target_name, target_name)
+                        if st.insn.aux is not None:
+                            self.call_eas[target_name] = st.insn.aux
                     self._add_line(out, "%sgoto %s;   // outside this function" % (pad, target_name), primary_ea=ea)
                 else:
                     txt = pad + self.rhs(st.insn) + ";"
@@ -2430,24 +3015,38 @@ class CGen(object):
                 for ch_insn in chain_insns:
                     self._suppressed_call_undefs.add(id(ch_insn))
                 is_zero = (k in ("z", "hz"))
+                n_before = len(self._cur_line_consts)
                 lhs = self.operand(d.srcs[0], 0, True, want_scalar=True, ew=d.ew)
+                n_mid = len(self._cur_line_consts)
                 rhs = self.operand(d.srcs[1], 0, True, want_scalar=True, ew=d.ew)
+                n_after = len(self._cur_line_consts)
 
-                if d.srcs[1].is_const and (d.srcs[1].val >> 96) == 0:
+                lhs_applied = (n_mid > n_before and self._cur_line_consts[n_mid - 1].get("applied"))
+                rhs_applied = (n_after > n_mid and self._cur_line_consts[n_after - 1].get("applied"))
+
+                if d.srcs[1].is_const and (d.srcs[1].val >> 96) == 0 and not rhs_applied:
                     rhs = "0"
-                if d.srcs[0].is_const and (d.srcs[0].val >> 96) == 0:
+                if d.srcs[0].is_const and (d.srcs[0].val >> 96) == 0 and not lhs_applied:
                     lhs = "0"
 
                 if d.op in (Op.CMPEQ, Op.FCMPEQ):
                     op_sym = "!=" if is_zero else "=="
                 elif d.op in (Op.CMPGT, Op.FCMPGT):
                     op_sym = "<=" if is_zero else ">"
-                    if op_sym == "<=" and rhs in ("-1", "-0x1", "-0x1:w4"):
+                    if not rhs_applied and op_sym == "<=" and rhs in ("-1", "-0x1", "-0x1:w4"):
                         op_sym = "<"
                         rhs = "0"
-                    elif op_sym == ">" and rhs in ("-1", "-0x1", "-0x1:w4"):
+                        if n_after > n_mid:
+                            self._cur_line_consts[n_after - 1]["text"] = "0"
+                            self._cur_line_consts[n_after - 1]["val"] = 0
+                            self._cur_line_consts[n_after - 1]["default_form"] = "dec"
+                    elif not rhs_applied and op_sym == ">" and rhs in ("-1", "-0x1", "-0x1:w4"):
                         op_sym = ">="
                         rhs = "0"
+                        if n_after > n_mid:
+                            self._cur_line_consts[n_after - 1]["text"] = "0"
+                            self._cur_line_consts[n_after - 1]["val"] = 0
+                            self._cur_line_consts[n_after - 1]["default_form"] = "dec"
                 elif d.op == Op.CMPGTU:
                     op_sym = "<=" if is_zero else ">"
 
@@ -2802,12 +3401,14 @@ def _signature(g, func):
 def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
              stk_of=None, this_of=None, sym_of=None,
              user_renames=None, user_types=None, user_proto=None,
-             user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None):
+             user_cmts=None, user_iflags=None, user_numforms=None, user_lvars=None,
+             hide_casts=False, struct_resolver=None):
     """Render the structured AST as pseudocode lines."""
     g = CGen(func, name_of, arity_of, str_of, stk_of, this_of, sym_of,
              user_renames=user_renames, user_types=user_types, user_proto=user_proto,
              user_cmts=user_cmts, user_iflags=user_iflags,
-             user_numforms=user_numforms, user_lvars=user_lvars)
+             user_numforms=user_numforms, user_lvars=user_lvars,
+             hide_casts=hide_casts, struct_resolver=struct_resolver)
     raw_name = func.name or "sub_%X" % func.start_ea
     if g.user_proto:
         from . import abi
@@ -2880,6 +3481,10 @@ def generate(func, stmts, info, name_of=None, arity_of=None, str_of=None,
 
     out.line_eas = [None] * header_count + g.body_eas + [None]
     out.line_to_eas = {header_count + k: v for k, v in g.body_line_to_eas.items()}
+    out.line_consts = {header_count + k: v for k, v in g.body_line_consts.items()}
+    out.call_eas = dict(g.call_eas)
+    out.sym_eas = dict(g.sym_eas)
+    out.hide_casts = g.hide_casts
     out.ea_to_line = {}
     for lineno, eas in out.line_to_eas.items():
         for ea in eas:

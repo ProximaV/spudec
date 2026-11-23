@@ -1020,6 +1020,520 @@ def test_decompiler_plugin_registration():
     print("ok  test_decompiler_plugin_registration")
 
 
+def test_proto_parser_advanced():
+    """Verify unnamed params, multi-star pointers, C++ qualified names, and IDA sanitization."""
+    # Unnamed parameters (like IDA tinfo_t.dstr() emits)
+    sig = abi._parse_proto("int __cdecl check_hdr(unsigned int, const char *, struct Elf32_Ehdr *)")
+    assert sig is not None
+    assert sig.name == "check_hdr"
+    assert sig.ret_type == "int"
+    assert len(sig.params) == 3
+    assert sig.params[0].type_str == "unsigned int" and sig.params[0].name == "a1"
+    assert sig.params[1].type_str == "const char *" and sig.params[1].name == "a2"
+    assert sig.params[2].type_str == "struct Elf32_Ehdr *" and sig.params[2].name == "a3"
+
+    # Multi-level pointers & array decay
+    sig2 = abi._parse_proto("void **dispatch(const char **argv, int ***pp, u8 buf[16])")
+    assert sig2 is not None
+    assert sig2.ret_type == "void **"
+    assert sig2.params[0].type_str == "const char **" and sig2.params[0].name == "argv"
+    assert sig2.params[1].type_str == "int ***" and sig2.params[1].name == "pp"
+    assert sig2.params[2].type_str == "u8 *" and sig2.params[2].name == "buf"
+
+    # C++ qualified method name + IDA sanitization
+    cpp_proto = "int lv0::elf_access::set_elf(lv0::elf_access *this, const unsigned char *buf, u32 size)"
+    sig3 = abi._parse_proto(cpp_proto)
+    assert sig3 is not None
+    assert sig3.name == "lv0::elf_access::set_elf"
+    assert len(sig3.params) == 3
+    assert sig3.params[0].name == "this" and sig3.params[0].type_str == "lv0::elf_access *"
+
+    san1 = abi.sanitize_decl_for_ida(cpp_proto, replace_this=True, replace_qualified_types=True)
+    assert "::" not in san1, f"Unexpected :: in sanitized decl: {san1}"
+    assert "_spudec_fn(" in san1, f"Expected _spudec_fn in: {san1}"
+    assert "void *_this_ptr" in san1, f"Expected sanitized this ptr in: {san1}"
+
+    print("ok  test_proto_parser_advanced")
+
+
+def test_numform_rendering_and_hide_casts():
+    """Verify per-constant user_numforms (hex/dec/char/bin/oct/signed/inv/str/nostr/offset/enum) and hide_casts."""
+    def repl(val, ew):
+        bits = int(ew) * 8
+        val &= (1 << bits) - 1
+        out = 0
+        for _ in range(16 // int(ew)):
+            out = (out << bits) | val
+        return out
+
+    f = Function(0xA000, "check_elf_magic")
+    b0 = f.new_block(0xA000, 0xA040)
+    b_exit = f.new_block(0xA040, 0xA050)
+    b0.succs = [b_exit]
+    b_exit.preds = [b0]
+
+    # Single-byte ELF magic compare 0x45 ('E') at 0xA000
+    b0.add(Insn(Op.CMPEQ, Var(5), [Var(3), Const(repl(0x45, EW.B), ew=EW.B)], EW.B, ea=0xA000, scalar=True))
+    # 32-bit ELF magic 0x7F454C46 at 0xA004
+    b0.add(Insn(Op.CMPEQ, Var(6), [Var(4), Const(0x7F454C46 << 96, ew=EW.W)], EW.W, ea=0xA004, scalar=True))
+    # Signed/unsigned word 0xFFFFFFF0 (-16) at 0xA008
+    b0.add(Insn(Op.XOR, Var(7), [Var(5), Const(repl(0xFFFFFFF0, EW.W), ew=EW.W)], EW.W, ea=0xA008, scalar=True))
+    # String / symbol address 0x20000 at 0xA00C
+    b0.add(Insn(Op.CONST, Var(8), [Const(0x20000 << 96, ew=EW.W)], EW.W, ea=0xA00C, scalar=True))
+    # Halfword add + unsigned halfword multiply (emits (u16) casts) at 0xA010 / 0xA012
+    b0.add(Insn(Op.ADD, Var(9), [Var(6), Const(repl(0x10, EW.H), ew=EW.H)], EW.H, ea=0xA010))
+    b0.add(Insn(Op.MPYU, Var(11), [Var(9), Var(4)], EW.W, ea=0xA012))
+    # Combine so nothing is DCE'd
+    b0.add(Insn(Op.OR, Var(10), [Var(7), Var(8)], EW.W, ea=0xA014, scalar=True))
+    b0.add(Insn(Op.OR, Var(3), [Var(10), Var(11)], EW.W, ea=0xA018, scalar=True))
+    b_exit.add(Insn(Op.RET, None, [Var(regs.R_MEM), Var(3)], ea=0xA040))
+
+    ssa.to_ssa(f)
+    opt.optimize(f)
+    outssa.lower_phis(f)
+    stmts, info = structure.structure(f)
+
+    str_map = {0x20000: '"ELF header"'}
+    sym_map = {0x20000: "g_elf_str"}
+
+    # 1. Default render records line_consts with column spans
+    lines_def = cgen.generate(f, stmts, info, str_of=str_map.get, sym_of=sym_map.get)
+    code_def = "\n".join(lines_def)
+    assert "0x45" in code_def
+    assert "0x7F454C46" in code_def
+    assert '"ELF header"' in code_def
+    assert "(u16)" in code_def
+    assert lines_def.line_consts, "Expected line_consts to be populated"
+    # Verify column spans match rendered text
+    for lno, clist in lines_def.line_consts.items():
+        for ci in clist:
+            s, e = ci["col_start"], ci["col_end"]
+            seg = lines_def[lno][s:e]
+            assert seg == ci["text"] or seg == ci["text"].lstrip("-"), \
+                f"Span mismatch on line {lno}: {seg!r} vs {ci['text']!r}"
+
+    # Locate the string constant's (ea, idx) from line_consts (exactly as view.py does!)
+    str_const = None
+    for clist in lines_def.line_consts.values():
+        for ci in clist:
+            if ci["text"] == '"ELF header"':
+                str_const = ci
+                break
+    assert str_const is not None, f"String constant not recorded in line_consts: {lines_def.line_consts}"
+    str_key = f"{hex(str_const['ea'])}:{str_const['idx']}"
+
+    # 2. Apply numform overrides across all formats (including multi-const line index!)
+    nf = {
+        "0xa000:0": "char",        # 0x45 -> 'E'
+        "0xa004:0": "char",        # 0x7F454C46 -> '\x7FELF'
+        "0xa008:0": "uhex",        # -0x10 -> 0xFFFFFFF0
+        str_key:    "nostr",       # "ELF header" -> 0x20000
+        "0xa010:0": "dec",         # 0x10 -> 16
+    }
+    lines_nf = cgen.generate(f, stmts, info, str_of=str_map.get, sym_of=sym_map.get, user_numforms=nf)
+    code_nf = "\n".join(lines_nf)
+    assert "'E'" in code_nf, f"Expected 'E' in:\n{code_nf}"
+    assert r"'\x7FELF'" in code_nf, f"Expected '\\x7FELF' in:\n{code_nf}"
+    assert "0xFFFFFFF0" in code_nf, f"Expected 0xFFFFFFF0 in:\n{code_nf}"
+    assert "0x20000" in code_nf and '"ELF header"' not in code_nf, f"Expected 0x20000 in:\n{code_nf}"
+    assert "16" in code_nf, f"Expected decimal 16 in:\n{code_nf}"
+
+    # 3. Binary, bitwise invert, offset, and case-preserved enum constant
+    nf2 = {
+        "0xa000:0": "bin",               # 0b1000101
+        "0xa004:0": "enum:ELF_MAGIC",    # ELF_MAGIC (exact case!)
+        "0xa008:0": "inv",               # ~0xF
+        str_key:    "offset",            # &g_elf_str
+    }
+    lines_nf2 = cgen.generate(f, stmts, info, str_of=str_map.get, sym_of=sym_map.get, user_numforms=nf2)
+    code_nf2 = "\n".join(lines_nf2)
+    assert "0b1000101" in code_nf2, f"Expected 0b1000101 in:\n{code_nf2}"
+    assert "ELF_MAGIC" in code_nf2, f"Expected ELF_MAGIC in:\n{code_nf2}"
+    assert "~0xF" in code_nf2, f"Expected ~0xF in:\n{code_nf2}"
+    assert "&g_elf_str" in code_nf2, f"Expected &g_elf_str in:\n{code_nf2}"
+
+    # 4. Hide casts
+    lines_hc = cgen.generate(f, stmts, info, hide_casts=True)
+    code_hc = "\n".join(lines_hc)
+    assert "(u16)" not in code_hc, f"Expected (u16) hidden in:\n{code_hc}"
+
+    # 5. db.set_numform preserves enum casing
+    db.clear_all()
+    db.set_numform(0xA000, 0xA004, 0, "enum:ELF_MAGIC")
+    assert db.get_numform(0xA000, 0xA004, 0) == "enum:ELF_MAGIC"
+    db.set_hide_casts(True)
+    assert db.get_hide_casts() is True
+    db.set_hide_casts(False)
+    assert db.get_hide_casts() is False
+
+    print("ok  test_numform_rendering_and_hide_casts")
+
+
+def test_user_struct_and_pointer_type_propagation():
+    """Verify typing a pointer/stack var as a struct or typed pointer renders p->field, p[i], var.field."""
+    def word0(v):
+        return (v & 0xFFFFFFFF) << 96
+
+    udts = {
+        "Elf32_Ehdr": {
+            "size": 52,
+            "fields": [
+                (0x00, 16, "e_ident", "u8", 1),
+                (0x10, 2,  "e_type", "u16", None),
+                (0x12, 2,  "e_machine", "u16", None),
+                (0x18, 4,  "e_entry", "u32", None),
+            ],
+        }
+    }
+
+    f = Function(0xB000, "parse_elf")
+    b0 = f.new_block(0xB000, 0xB040)
+    b_exit = f.new_block(0xB040, 0xB050)
+    b0.succs = [b_exit]
+    b_exit.preds = [b0]
+
+    # a1 (r3) = Elf32_Ehdr *, a2 (r4) = u32 *, a3 (r5) = index
+    # Read a1 + 1 (byte -> e_ident[1]), a1 + 0x10 (halfword -> e_type), a1 + 0x18 (word -> e_entry)
+    b0.add(Insn(Op.ADD, Var(10), [Var(3), Const(word0(1))], EW.W, ea=0xB000, scalar=True))
+    b0.add(Insn(Op.LOAD, Var(11), [Var(regs.R_MEM), Var(10)], EW.B, ea=0xB004, scalar=True))
+    b0.add(Insn(Op.ADD, Var(12), [Var(3), Const(word0(0x10))], EW.W, ea=0xB008, scalar=True))
+    b0.add(Insn(Op.LOAD, Var(13), [Var(regs.R_MEM), Var(12)], EW.H, ea=0xB00C, scalar=True))
+    b0.add(Insn(Op.ADD, Var(14), [Var(3), Const(word0(0x18))], EW.W, ea=0xB010, scalar=True))
+    b0.add(Insn(Op.LOAD, Var(15), [Var(regs.R_MEM), Var(14)], EW.W, ea=0xB014, scalar=True))
+
+    # Read a2 + 8 (word -> a2[2]) and a2 + (a3 << 2) (word -> a2[a3])
+    b0.add(Insn(Op.ADD, Var(16), [Var(4), Const(word0(8))], EW.W, ea=0xB018, scalar=True))
+    b0.add(Insn(Op.LOAD, Var(17), [Var(regs.R_MEM), Var(16)], EW.W, ea=0xB01C, scalar=True))
+    b0.add(Insn(Op.SHL, Var(18), [Var(5), Const(word0(2))], EW.W, ea=0xB020, scalar=True))
+    b0.add(Insn(Op.ADD, Var(19), [Var(4), Var(18)], EW.W, ea=0xB024, scalar=True))
+    b0.add(Insn(Op.LOAD, Var(20), [Var(regs.R_MEM), Var(19)], EW.W, ea=0xB028, scalar=True))
+
+    # Combine into r3
+    b0.add(Insn(Op.ADD, Var(21), [Var(11), Var(13)], EW.W, ea=0xB02C, scalar=True))
+    b0.add(Insn(Op.ADD, Var(22), [Var(21), Var(15)], EW.W, ea=0xB030, scalar=True))
+    b0.add(Insn(Op.ADD, Var(23), [Var(22), Var(17)], EW.W, ea=0xB034, scalar=True))
+    b0.add(Insn(Op.ADD, Var(3), [Var(23), Var(20)], EW.W, ea=0xB038, scalar=True))
+    b_exit.add(Insn(Op.RET, None, [Var(regs.R_MEM), Var(3)], ea=0xB040))
+
+    ssa.to_ssa(f)
+    opt.optimize(f)
+    outssa.lower_phis(f)
+    stmts, info = structure.structure(f)
+
+    lines = cgen.generate(
+        f, stmts, info,
+        user_types={"a1": "Elf32_Ehdr *", "a2": "u32 *"},
+        struct_resolver=udts.get,
+    )
+    code = "\n".join(lines)
+    assert "a1->e_ident[1]" in code, f"Expected a1->e_ident[1] in:\n{code}"
+    assert "a1->e_type" in code, f"Expected a1->e_type in:\n{code}"
+    assert "a1->e_entry" in code, f"Expected a1->e_entry in:\n{code}"
+    assert "a2[2]" in code, f"Expected a2[2] in:\n{code}"
+    assert "a2[a3]" in code, f"Expected a2[a3] in:\n{code}"
+
+    print("ok  test_user_struct_and_pointer_type_propagation")
+
+
+def test_view_nav_history_and_hotkeys():
+    """Verify UIJMP_DONTPUSH eliminates nav history flooding and H/A/R/B/_/~/M/\\/Y/Esc/Tab work."""
+    import types as _types
+
+    modules_to_restore = {}
+    mod_names = [
+        "ida_kernwin", "ida_funcs", "ida_lines", "ida_typeinf", "idaapi",
+        "ida_nalt", "ida_bytes", "ida_name", "ida_idaapi", "ida_frame",
+    ]
+    for mn in mod_names:
+        modules_to_restore[mn] = sys.modules.get(mn)
+        sys.modules[mn] = _types.ModuleType(mn)
+
+    ik = sys.modules["ida_kernwin"]
+    ifuncs = sys.modules["ida_funcs"]
+    ilines = sys.modules["ida_lines"]
+    itinf = sys.modules["ida_typeinf"]
+    iapi = sys.modules["idaapi"]
+    inalt = sys.modules["ida_nalt"]
+    ibytes = sys.modules["ida_bytes"]
+    iname = sys.modules["ida_name"]
+    iida = sys.modules["ida_idaapi"]
+
+    iapi.BADADDR = 0xFFFFFFFF
+    iida.BADADDR = 0xFFFFFFFF
+    ik.UIJMP_ACTIVATE = 0x0001
+    ik.UIJMP_DONTPUSH = 0x0002
+    ik.UIJMP_IDAVIEW = 0x0004
+    ik.AST_ENABLE_FOR_WIDGET = 1
+    ik.AST_DISABLE_FOR_WIDGET = 0
+    ik.BWN_DISASM = 1
+
+    jumpto_log = []
+    ik.jumpto = lambda ea, opnum=-1, flags=0: jumpto_log.append((ea, flags)) or True
+    ik.get_screen_ea = lambda: 0x1000
+    ik.refresh_idaview_anyway = lambda: None
+    ik.execute_ui_requests = lambda reqs: [r() for r in reqs]
+    ik.process_ui_action = lambda name: True
+    xrefs_log = []
+    ik.open_xrefs_window = lambda ea: xrefs_log.append(ea) or True
+
+    ask_answers = []
+    ik.ask_str = lambda default, hist, prompt: ask_answers.pop(0) if ask_answers else default
+    ik.warning = lambda msg: None
+    registered_actions = {}
+    ik.action_desc_t = lambda name, label, handler, shortcut, tooltip=None: {
+        "name": name, "label": label, "handler": handler, "shortcut": shortcut, "tooltip": tooltip
+    }
+    ik.register_action = lambda desc: registered_actions.setdefault(desc["name"], desc) or True
+    ik.unregister_action = lambda name: registered_actions.pop(name, None)
+
+    class _AH:
+        pass
+    class _UIH:
+        def hook(self): pass
+        def unhook(self): pass
+    class _VH:
+        def hook(self): pass
+        def unhook(self): pass
+    class _SCV:
+        def __init__(self):
+            self._lines = []
+            self._pos = (0, 0)
+            self._widget = object()
+        def Create(self, title): return True
+        def Show(self): return True
+        def Close(self): return True
+        def GetWidget(self): return self._widget
+        def ClearLines(self): self._lines.clear()
+        def AddLine(self, s): self._lines.append(s)
+        def EditLine(self, idx, s, bgcolor=0xFFFFFFFF):
+            if 0 <= idx < len(self._lines):
+                self._lines[idx] = s
+        def Refresh(self): pass
+        def RefreshCurrent(self): pass
+        def GetPos(self): return self._pos
+        def Jump(self, lno, col=0): self._pos = (lno, col)
+        def GetCurrentWord(self): return ""
+
+    ik.action_handler_t = _AH
+    ik.UI_Hooks = _UIH
+    ik.View_Hooks = _VH
+    ik.simplecustviewer_t = _SCV
+
+    ilines.COLSTR = lambda t, c: t
+    ilines.tag_remove = lambda s: s
+    for n in ("AUTOCMT", "NUMBER", "KEYWORD", "TYPE", "CREFTAIL", "CNAME",
+              "REG", "SYMBOL", "MACRO", "STRING", "EXTRA", "CHAR", "DREF", "ERROR"):
+        setattr(ilines, "SCOLOR_" + n, n)
+
+    inalt.set_item_color = lambda ea, c: None
+    inalt.del_item_color = lambda ea: None
+    inalt.STRTYPE_C = 0
+    inalt.get_tinfo = lambda tif, ea: False
+
+    strlit_created = []
+    loaded_mem = {0x20000: ord('H')}
+    ibytes.is_loaded = lambda ea: ea in loaded_mem
+    ibytes.get_byte = lambda ea: loaded_mem.get(ea, 0)
+    ibytes.create_strlit = lambda ea, l, t: strlit_created.append(ea) or True
+
+    class _Func:
+        def __init__(self, start_ea):
+            self.start_ea = start_ea
+    known_funcs = {0x1000: _Func(0x1000), 0x2000: _Func(0x2000)}
+    ifuncs.get_func = lambda ea: known_funcs.get(ea & ~0xFF)
+    iname.get_name_ea = lambda frm, nm: {"callee_fn": 0x2000}.get(nm, 0xFFFFFFFF)
+
+    class _Tinfo:
+        def is_func(self): return True
+        def is_udt(self): return False
+        def is_enum(self): return False
+        def get_named_type(self, til, name): return False
+    itinf.tinfo_t = _Tinfo
+    itinf.PT_TYP = 1
+    itinf.PT_SIL = 2
+    itinf.TINFO_DEFINITE = 1
+    itinf.parse_decl = lambda tif, til, decl, flags: decl
+    itinf.apply_tinfo = lambda ea, tif, flags: True
+    itinf.get_idati = lambda: None
+
+    try:
+        for m in ("spudec.highlight", "spudec.view"):
+            sys.modules.pop(m, None)
+        from spudec import view
+
+        db.clear_all()
+        v = view._DecompilerView()
+        view._register_actions(v)
+
+        # 1. Verify all Hex-Rays shortcuts are registered with widget-scoped update()
+        shortcuts = {d["shortcut"] for d in registered_actions.values() if d["shortcut"]}
+        for expected_key in ("H", "A", "R", "B", "N", "Y", "/", ";", "_", "~", "O", "M", "\\", "I", "Shift+I", "X", "G", "Tab", "Esc", "Ctrl+Enter"):
+            assert expected_key in shortcuts, f"Missing registered shortcut {expected_key!r} in {shortcuts}"
+
+        # Verify widget scoping: enabled ONLY on viewer widget, disabled on other widgets
+        h_handler = registered_actions[view.ACTION_TOGGLE_HEX]["handler"]
+        ctx_self = _types.SimpleNamespace(widget=v.GetWidget())
+        ctx_other = _types.SimpleNamespace(widget=object())
+        assert h_handler.update(ctx_self) == ik.AST_ENABLE_FOR_WIDGET
+        assert h_handler.update(ctx_other) == ik.AST_DISABLE_FOR_WIDGET
+
+        # Prepare two synthetic functions on the viewer
+        shown_funcs = []
+        def _fake_show_func(ea, preserve_cursor=False):
+            shown_funcs.append(ea)
+            v.current_func_ea = ea
+            v.current_func_name = "func_A" if ea == 0x1000 else "callee_fn"
+            v.raw_lines = [
+                f"int {v.current_func_name}(u32 a1)",
+                "{",
+                "    if ( a1 == 0x45 )",
+                "        callee_fn(0x20000);",
+                "    return 0;",
+                "}",
+            ]
+            v.sig_line = 0
+            v.params = ["a1"]
+            v.param_types = {"a1": "u32"}
+            v.var_types = {"a1": "u32"}
+            v.line_ea = [ea, None, ea + 4, ea + 8, ea + 12, None]
+            v.line_to_eas = {0: [ea], 2: [ea + 4], 3: [ea + 8], 4: [ea + 12]}
+            v.ea_to_line = {ea: 0, ea + 4: 2, ea + 8: 3, ea + 12: 4}
+            v.call_eas = {"callee_fn": 0x2000}
+            v.line_consts = {
+                2: [{
+                    "idx": 0, "ea": ea + 4, "val": 0x45, "bits": 8,
+                    "text": "0x45", "default_form": "hex",
+                    "form": db.get_numform(ea, ea + 4, 0) or "hex",
+                    "is_addr": False, "addr_val": 0x45, "col_start": 15, "col_end": 19,
+                }],
+                3: [{
+                    "idx": 0, "ea": ea + 8, "val": 0x20000, "bits": 32,
+                    "text": "0x20000", "default_form": "hex",
+                    "form": db.get_numform(ea, ea + 8, 0) or "hex",
+                    "is_addr": True, "addr_val": 0x20000, "col_start": 18, "col_end": 25,
+                }],
+            }
+            return True
+
+        v.show_func = _fake_show_func
+        v.show_func(0x1000)
+
+        # 2. Scrolling through lines in func_A MUST NEVER push nav history (UIJMP_DONTPUSH always set!)
+        jumpto_log.clear()
+        for ln in (2, 3, 4, 2, 3, 4):
+            v._pos = (ln, 4)
+            v.on_cursor_changed()
+        assert len(jumpto_log) == 6
+        for ea_j, fl in jumpto_log:
+            assert fl & ik.UIJMP_DONTPUSH, f"Scrolling pushed history! ea=0x{ea_j:X}, flags=0x{fl:X}"
+            assert not (fl & ik.UIJMP_ACTIVATE), f"Scrolling stole focus! flags=0x{fl:X}"
+
+        # 3. Clicking through to callee_fn pushes ONE history entry (NO UIJMP_DONTPUSH)
+        jumpto_log.clear()
+        v._pos = (3, 10)  # cursor on `callee_fn`
+        assert v.jump_disasm() is True
+        assert v.current_func_ea == 0x2000
+        assert len(v._nav_history) == 1 and v._nav_history[0][0] == 0x1000
+        assert len(jumpto_log) == 1
+        assert jumpto_log[0][0] == 0x2000
+        assert not (jumpto_log[0][1] & ik.UIJMP_DONTPUSH), "Callee jump should push nav history!"
+
+        # 4. Scroll in callee_fn -> still UIJMP_DONTPUSH; then Esc returns straight to func_A!
+        jumpto_log.clear()
+        for ln in (2, 3, 4):
+            v._pos = (ln, 4)
+            v.on_cursor_changed()
+        assert all(fl & ik.UIJMP_DONTPUSH for _, fl in jumpto_log)
+
+        jumpto_log.clear()
+        assert v.on_nav_back() is True
+        assert v.current_func_ea == 0x1000
+        assert len(v._nav_forward) == 1 and v._nav_forward[0][0] == 0x2000
+        assert all(fl & ik.UIJMP_DONTPUSH for _, fl in jumpto_log)
+
+        # Ctrl-Enter goes forward back to callee_fn
+        assert v.on_nav_forward() is True
+        assert v.current_func_ea == 0x2000
+        assert v.on_nav_back() is True
+        assert v.current_func_ea == 0x1000
+
+        # 5. Tab switches to Disassembly with UIJMP_ACTIVATE | UIJMP_DONTPUSH
+        jumpto_log.clear()
+        v._pos = (2, 15)
+        assert v.on_switch_to_disasm() is True
+        assert jumpto_log[-1][1] & ik.UIJMP_ACTIVATE
+        assert jumpto_log[-1][1] & ik.UIJMP_DONTPUSH
+
+        # 6. Hotkeys H (hex <-> dec), R (char), A (char on imm / create_strlit on addr), B, _, ~, M, \
+        v._pos = (2, 16)  # on 0x45
+        assert v.on_toggle_hex() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "dec"
+        assert v.on_toggle_hex() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "hex"
+
+        assert v.on_toggle_char() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "char"
+        assert v.on_toggle_char() is True
+        assert db.get_numform(0x1000, 0x1004, 0) is None
+
+        # A on non-address immediate -> char; A on loaded address -> create_strlit + str
+        assert v.on_make_ascii() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "char"
+        v._pos = (3, 20)  # on 0x20000 (loaded ASCII 'H')
+        assert v.on_make_ascii() is True
+        assert 0x20000 in strlit_created
+        assert db.get_numform(0x1000, 0x1008, 0) == "str"
+
+        v._pos = (2, 16)
+        assert v.on_toggle_bin() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "bin"
+        assert v.on_toggle_signed() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "shex"
+        assert v.on_toggle_invert_bits() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "inv"
+
+        ask_answers.append("ELF_CHAR_E")
+        assert v.on_set_enum() is True
+        assert db.get_numform(0x1000, 0x1004, 0) == "enum:ELF_CHAR_E"
+
+        # Hide casts toggle (\)
+        assert db.get_hide_casts() is False
+        assert v.on_toggle_casts() is True
+        assert db.get_hide_casts() is True
+        assert v.on_toggle_casts() is True
+        assert db.get_hide_casts() is False
+
+        # Y on parameter inside body updates prototype + db
+        v._pos = (2, 10)  # cursor on `a1` inside body
+        ask_answers.append("Elf32_Ehdr *")
+        v.on_set_type()
+        assert db.get_func_data(0x1000)["types"]["a1"] == "Elf32_Ehdr *"
+        assert "Elf32_Ehdr *a1" in (db.get_func_data(0x1000)["proto"] or "")
+
+        # X on callee opens xrefs window on callee_ea
+        v._pos = (3, 10)  # cursor on `callee_fn`
+        assert v.on_show_xrefs() is True
+        assert xrefs_log[-1] == 0x2000
+
+        # Verify database_inited accepts 2 args (IDA 9.5)
+        view._active_viewer = v
+        hooks = view._UiHooks(v)
+        hooks.database_inited(False, "")
+        view._active_viewer = None
+
+        db.clear_all()
+    finally:
+        for mn, old_m in modules_to_restore.items():
+            if old_m is None:
+                sys.modules.pop(mn, None)
+            else:
+                sys.modules[mn] = old_m
+        sys.modules.pop("spudec.view", None)
+        sys.modules.pop("spudec.highlight", None)
+
+    print("ok  test_view_nav_history_and_hotkeys")
+
+
 if __name__ == "__main__":
     test_db_persistence()
     test_proto_parser()
@@ -1040,4 +1554,8 @@ if __name__ == "__main__":
     test_hexrays_parity_features()
     test_byte_and_halfword_constant_formatting()
     test_decompiler_plugin_registration()
+    test_proto_parser_advanced()
+    test_numform_rendering_and_hide_casts()
+    test_user_struct_and_pointer_type_propagation()
+    test_view_nav_history_and_hotkeys()
     print("\nall recover tests passed")

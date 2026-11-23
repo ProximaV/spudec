@@ -443,7 +443,8 @@ ensure_spu_types()
 
 def pseudocode(ea, name_of=None, arity=None, str_of=None,
                stk_of=None, this_of=None, sym_of=None,
-               user_renames=None, user_types=None, user_proto=None, **kw):
+               user_renames=None, user_types=None, user_proto=None,
+               hide_casts=None, struct_resolver=None, **kw):
     """
     Full pipeline: lift, SSA, optimise, scalarise, structure, render.
 
@@ -488,12 +489,28 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
                 tif = ida_typeinf.tinfo_t()
                 if ida_nalt.get_tinfo(tif, fn_ea) and tif.is_func():
                     fn_name = func.name or ("sub_%X" % fn_ea)
-                    d = tif.dstr()
-                    if "(" in d:
-                        ret_part, args_part = d.split("(", 1)
-                        user_proto = "%s %s(%s" % (ret_part.strip(), fn_name, args_part)
+                    ftd = ida_typeinf.func_type_data_t()
+                    if tif.get_func_details(ftd):
+                        ret_s = ftd.rettype.dstr() or "void"
+                        pstrs = []
+                        for idx, arg in enumerate(ftd):
+                            at = arg.type.dstr() or "qword"
+                            an = arg.name or ("a%d" % (idx + 1))
+                            sep = "" if at.endswith("*") else " "
+                            pstrs.append("%s%s%s" % (at, sep, an))
+                        pjoin = ", ".join(pstrs) if pstrs else "void"
+                        rsep = "" if ret_s.endswith("*") else " "
+                        user_proto = "%s%s%s(%s)" % (ret_s, rsep, fn_name, pjoin)
+                    else:
+                        d = tif.dstr()
+                        if "(" in d:
+                            ret_part, args_part = d.split("(", 1)
+                            user_proto = "%s %s(%s" % (ret_part.strip(), fn_name, args_part)
             except Exception:
                 pass
+
+    if hide_casts is None:
+        hide_casts = db.get_hide_casts()
 
     if arity is None:
         arity = arity_of
@@ -513,4 +530,5 @@ def pseudocode(ea, name_of=None, arity=None, str_of=None,
                          user_renames=user_renames, user_types=user_types,
                          user_proto=user_proto,
                          user_cmts=user_cmts, user_iflags=user_iflags,
-                         user_numforms=user_numforms, user_lvars=user_lvars)
+                         user_numforms=user_numforms, user_lvars=user_lvars,
+                         hide_casts=hide_casts, struct_resolver=struct_resolver)

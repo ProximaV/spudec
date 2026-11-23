@@ -32,6 +32,13 @@ def test_highlight():
     hl = H.colorize(tok_line, highlight_ident="packet_counter")
     assert "<extra>packet_counter</extra>" in hl
     assert hl.count("<extra>packet_counter</extra>") == 2
+
+    # Character literals, binary literals, integer suffixes, and expanded types
+    assert "<string>'E'</string>" in H.colorize("    if ( c == 'E' )")
+    assert r"<string>'\x7FELF'</string>" in H.colorize(r"    if ( magic == '\x7FELF' )")
+    assert "<number>0b101010</number>" in H.colorize("    x = 0b101010;")
+    assert "<number>0x7Fu</number>" in H.colorize("    x = 0x7Fu;")
+    assert "<type>bool</type>" in H.colorize("    bool ok;")
     print("ok  test_highlight")
 
 
